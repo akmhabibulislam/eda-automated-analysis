@@ -2,10 +2,10 @@
 DataSight Enterprise Analytics Platform.
 Main UI Controller with modern workspace layout and optimized execution pipelines.
 Integrates all 52 end-to-end data analysis features across 6 structured workspaces:
-- Workspace 1: Data Ingestion, Schema & Memory Profiling (Features 1-5 + Opt)
-- Workspace 2: Data Quality, Auto-Cleaning & Lineage (Features 6-13)
+- Workspace 1: Data Ingestion, Schema & Memory Profiling (Features 1-5 + Memory Optimization)
+- Workspace 2: Data Quality, Recommendations & Controlled Clean (Features 6-13)
 - Workspace 3: Advanced Wrangling & Reshaping (Features 20-26)
-- Workspace 4: Statistical Testing & Exploratory Analysis (Features 14-19, 27-31)
+- Workspace 4: Statistics & Hypothesis Testing (Features 14-19, 27-31)
 - Workspace 5: Time-Series & Mathematical Modeling (Features 32-41)
 - Workspace 6: Dynamic Visual Studio & Executive Reports (Features 42-52)
 """
@@ -50,6 +50,7 @@ from backend.cleaning.cleaning import (
     treat_outliers,
     clean_text_columns,
     cast_data_types,
+    analyze_cleaning_recommendations,
     run_automated_cleaning
 )
 from backend.cleaning.wrangling import (
@@ -60,14 +61,15 @@ from backend.cleaning.wrangling import (
     extract_regex_patterns,
     pivot_dataframe,
     unpivot_dataframe,
-    filter_rows
+    filter_rows_structured
 )
 from backend.analysis.statistics import (
     compute_univariate_summary,
     compute_categorical_distribution,
     compute_missingness_matrix,
     compute_correlation_matrix,
-    detect_multicollinearity,
+    detect_highly_correlated_pairs,
+    compute_variance_inflation_factors,
     compute_skewness_kurtosis
 )
 from backend.analysis.hypothesis import (
@@ -144,7 +146,7 @@ with st.sidebar:
         "Analytical Workspace",
         [
             "1. Ingestion & Memory Profiling",
-            "2. Data Quality & Auto-Clean",
+            "2. Data Quality & Controlled Clean",
             "3. Advanced Data Wrangling",
             "4. Statistics & Hypothesis Testing",
             "5. Time-Series & Math Modeling",
@@ -168,7 +170,7 @@ with st.sidebar:
 
 
 # ==============================================================================
-# TOP PERSISTENT STATUS BANNER
+# TOP STATUS BANNER
 # ==============================================================================
 ds_status = "Active" if st.session_state.df is not None else "Awaiting Data"
 badge_color = "#ecfdf5" if st.session_state.df is not None else "#fef2f2"
@@ -194,24 +196,29 @@ st.markdown(f"""
 # ==============================================================================
 if active_workspace == "1. Ingestion & Memory Profiling":
     st.subheader("Data Ingestion & Memory Profiling")
-    st.caption("Load multi-format data files or execute live database queries with automatic numeric downcasting and low-cardinality category conversion.")
+    st.caption("Load multi-format data files or execute secure database queries with integer downcasting and memory profiling.")
 
     src_tab, db_tab, demo_tab = st.tabs(["File Ingestion", "Database Connectivity", "Pre-Loaded Datasets"])
 
     with src_tab:
         up_file = st.file_uploader("Select data file (CSV, TSV, Excel, JSON, Parquet)", type=["csv", "tsv", "tab", "xlsx", "xls", "json", "parquet"])
 
-        col_c1, col_c2 = st.columns(2)
+        col_c1, col_c2, col_c3 = st.columns(3)
         with col_c1:
-            auto_opt = st.checkbox("Automatic Type Downcasting (int64/float64 to int32/float32 & category)", value=True)
+            downcast_int = st.checkbox("Integer Downcasting (Safe)", value=True)
         with col_c2:
-            use_sample = st.checkbox("Enable Row Sampling Limit", value=False)
+            downcast_flt = st.checkbox("Float Downcasting (Precision trade-off)", value=False)
+        with col_c3:
+            use_sample = st.checkbox("Limit Preview Rows", value=False)
             max_rows = st.number_input("Maximum Rows", min_value=100, max_value=2000000, value=50000) if use_sample else None
 
         if up_file is not None and st.button("Ingest and Optimize Dataset"):
-            with st.spinner("Ingesting file and optimizing memory footprint..."):
+            with st.spinner("Ingesting file and profiling memory footprint..."):
                 try:
-                    df, meta = load_dataset(up_file, up_file.name, auto_optimize=auto_opt, sample_rows=max_rows)
+                    df, meta = load_dataset(up_file, up_file.name, auto_optimize=False, sample_rows=max_rows)
+                    if downcast_int or downcast_flt:
+                        df, opt_m = optimize_dataframe_memory(df, downcast_integers=downcast_int, downcast_floats=downcast_flt)
+                        meta["memory_optimization"] = opt_m
                     st.session_state.df = df
                     st.session_state.original_df = df.copy()
                     st.session_state.dataset_name = up_file.name
@@ -223,13 +230,14 @@ if active_workspace == "1. Ingestion & Memory Profiling":
                     st.error(f"Ingestion failed: {str(e)}")
 
     with db_tab:
-        st.markdown("##### Relational Database Connector")
+        st.markdown("##### Secure Relational Database Connector")
+        st.caption("Read-only validation enforced (only SELECT queries permitted with configurable timeouts).")
         db_conn = st.text_input("SQLAlchemy URI", value="sqlite:///example.db", placeholder="postgresql://user:pass@localhost:5432/dbname")
-        db_sql = st.text_area("SQL Statement", value="SELECT * FROM dataset LIMIT 1000;")
+        db_sql = st.text_area("SQL Statement (Read-only)", value="SELECT * FROM dataset LIMIT 1000;")
         if st.button("Query Database"):
-            with st.spinner("Executing query..."):
+            with st.spinner("Executing query safely..."):
                 try:
-                    df, meta = load_from_database(db_conn, db_sql, auto_optimize=auto_opt)
+                    df, meta = load_from_database(db_conn, db_sql, auto_optimize=downcast_int)
                     st.session_state.df = df
                     st.session_state.original_df = df.copy()
                     st.session_state.dataset_name = "Database Query"
@@ -282,7 +290,7 @@ if active_workspace == "1. Ingestion & Memory Profiling":
                     "vibration": np.random.exponential(scale=1.2, size=n)
                 })
 
-            df_bench, _ = optimize_dataframe_memory(df_bench)
+            df_bench, _ = optimize_dataframe_memory(df_bench, downcast_integers=True)
             st.session_state.df = df_bench
             st.session_state.original_df = df_bench.copy()
             st.session_state.dataset_name = demo_sel
@@ -331,11 +339,11 @@ if active_workspace == "1. Ingestion & Memory Profiling":
 
 
 # ==============================================================================
-# WORKSPACE 2: Data Quality, Auto-Cleaning & Lineage (Features 6-13)
+# WORKSPACE 2: Data Quality, Recommendations & Controlled Clean (Features 6-13)
 # ==============================================================================
-elif active_workspace == "2. Data Quality & Auto-Clean":
-    st.subheader("Data Quality, Auto-Cleaning & Audit Lineage")
-    st.caption("Apply automated one-click pipelines or configure granular imputation, outlier clipping, and type conversions.")
+elif active_workspace == "2. Data Quality & Controlled Clean":
+    st.subheader("Data Quality, Recommendations & Controlled Cleaning")
+    st.caption("Review automated recommendations, configure controlled cleaning pipelines, and inspect data lineage without blind mutations.")
 
     if st.session_state.df is None:
         st.info("Please load a dataset in Workspace 1 first.")
@@ -343,14 +351,50 @@ elif active_workspace == "2. Data Quality & Auto-Clean":
         df = st.session_state.df
         logger = st.session_state.audit_logger
 
-        st.markdown("#### One-Click Auto-Clean Pipeline")
-        st.write("Executes column standardization, duplicate removal, text trimming, median/mode imputation, and safe outlier capping.")
-        if st.button("Run One-Click Automated Cleaning", type="primary"):
-            with st.spinner("Executing cleaning pipeline..."):
-                cleaned_df, summary = run_automated_cleaning(df, logger=logger)
-                cleaned_df, _ = optimize_dataframe_memory(cleaned_df)
+        # Automated Cleaning Recommendations Card
+        st.markdown("#### Automated Quality Recommendations")
+        recs = analyze_cleaning_recommendations(df)
+        r_col1, r_col2 = st.columns(2)
+        with r_col1:
+            st.write(f"**Duplicate Rows**: {recs['duplicate_rows']}")
+            st.write(f"**Columns with Missing Values**: {len(recs['missing_columns'])}")
+            if recs["missing_columns"]:
+                st.caption(f"Missing Columns: {list(recs['missing_columns'].keys())}")
+        with r_col2:
+            st.write(f"**Header Standardization Needed**: {'Yes' if recs['header_standardization_needed'] else 'No'}")
+            st.write(f"**Outlier Candidate Columns**: {len(recs['outlier_candidates'])}")
+            if recs["outlier_candidates"]:
+                st.caption(f"Outlier Columns: {list(recs['outlier_candidates'].keys())}")
+
+        st.markdown("---")
+        st.markdown("#### Controlled Auto-Clean Pipeline")
+        st.write("Configure which operations to execute (imputation and outlier capping are strictly opt-in).")
+
+        cfg_c1, cfg_c2, cfg_c3, cfg_c4, cfg_c5 = st.columns(5)
+        with cfg_c1:
+            opt_headers = st.checkbox("Standardize Headers", value=True)
+        with cfg_c2:
+            opt_dups = st.checkbox("Purge Duplicates", value=True)
+        with cfg_c3:
+            opt_strings = st.checkbox("Trim String Spaces", value=True)
+        with cfg_c4:
+            opt_impute = st.checkbox("Impute Missing (Median/Mode)", value=False)
+        with cfg_c5:
+            opt_outliers = st.checkbox("Cap Outliers (IQR 3.0)", value=False)
+
+        if st.button("Execute Controlled Cleaning Pipeline", type="primary"):
+            with st.spinner("Executing configured pipeline..."):
+                cleaned_df, summary = run_automated_cleaning(
+                    df,
+                    logger=logger,
+                    impute_missing=opt_impute,
+                    cap_outliers=opt_outliers,
+                    standardize_headers=opt_headers,
+                    purge_duplicates=opt_dups,
+                    clean_strings=opt_strings
+                )
                 st.session_state.df = cleaned_df
-                st.success(f"Cleaning complete. {summary['steps_executed']} operations executed.")
+                st.success(f"Cleaning complete. {summary['steps_executed']} operations recorded.")
                 st.rerun()
 
         st.markdown("---")
@@ -404,7 +448,7 @@ elif active_workspace == "2. Data Quality & Auto-Clean":
                 if st.button("Execute Outlier Treatment"):
                     treated_df, info = treat_outliers(df, column=o_col, method=o_meth, threshold=float(o_th), action=o_act, logger=logger)
                     st.session_state.df = treated_df
-                    st.success(f"Processed {info['outliers_detected']} anomalies outside bounds [{info['lower_bound']:.2f}, {info['upper_bound']:.2f}].")
+                    st.success(f"Processed {info['outliers_detected']} anomalies outside bounds.")
                     st.rerun()
             else:
                 st.info("No numeric columns available.")
@@ -421,7 +465,7 @@ elif active_workspace == "2. Data Quality & Auto-Clean":
                     st.rerun()
 
             with t_col:
-                st.markdown("**Text String Cleaning**")
+                st.markdown("**Text String Cleaning (Nulls Preserved)**")
                 str_cols = [c for c in df.columns if isinstance(df[c].dtype, (pd.CategoricalDtype, pd.StringDtype)) or df[c].dtype == "object"]
                 t_cols_sel = st.multiselect("Text Columns to Clean", str_cols)
                 tr_ws = st.checkbox("Trim Whitespace", value=True)
@@ -441,7 +485,7 @@ elif active_workspace == "2. Data Quality & Auto-Clean":
                     st.rerun()
 
         with q_tab5:
-            st.markdown("##### Data Type Casting")
+            st.markdown("##### Data Type Casting (with Robust Boolean Parser)")
             cast_col = st.selectbox("Column to Cast", df.columns)
             target_t = st.selectbox("Target Datatype", ["int", "float", "string", "datetime", "boolean", "category"])
             if st.button("Apply Datatype Cast"):
@@ -472,7 +516,7 @@ elif active_workspace == "2. Data Quality & Auto-Clean":
 # ==============================================================================
 elif active_workspace == "3. Advanced Data Wrangling":
     st.subheader("Advanced Data Wrangling & Reshaping")
-    st.caption("Custom formula evaluation, continuous binning, SQL-like aggregations, regex pattern extraction, and pivoting.")
+    st.caption("Secure AST formula evaluation, continuous binning, SQL-like aggregations, regex pattern extraction, and structured filtering.")
 
     if st.session_state.df is None:
         st.info("Please load a dataset in Workspace 1 first.")
@@ -481,14 +525,14 @@ elif active_workspace == "3. Advanced Data Wrangling":
         logger = st.session_state.audit_logger
 
         w_tab1, w_tab2, w_tab3, w_tab4, w_tab5, w_tab6 = st.tabs([
-            "Formula Builder", "Continuous Binning", "SQL Aggregation", "Regex Extraction", "Pivot / Reshape", "Query Filter"
+            "Secure Formula Builder", "Continuous Binning", "SQL Aggregation", "Regex Extraction", "Pivot / Reshape", "Structured Filter"
         ])
 
         with w_tab1:
-            st.markdown("##### Robust Formula Column Builder")
-            st.caption("Supports standard column references with spaces (e.g., `Revenue - Cost` or `np.log(Price)`).")
+            st.markdown("##### Secure AST Formula Column Builder")
+            st.caption("Evaluates mathematical expressions safely using an abstract syntax tree parser without code injection risks.")
             new_col = st.text_input("New Column Name", "calculated_metric")
-            form_expr = st.text_input("Formula Expression", "")
+            form_expr = st.text_input("Formula Expression (e.g. `revenue - cost` or `sqrt(units_sold) * 10`)", "")
             st.write(f"Available columns: `{', '.join(df.columns)}`")
 
             if st.button("Evaluate Formula"):
@@ -563,15 +607,19 @@ elif active_workspace == "3. Advanced Data Wrangling":
                     st.dataframe(u_res, use_container_width=True)
 
         with w_tab6:
-            st.markdown("##### Custom Row Query Filter")
-            q_expr = st.text_input("Query Expression (e.g., `units_sold > 20 and revenue > 500`)", "")
-            if q_expr and st.button("Apply Filter"):
+            st.markdown("##### Structured Row Query Filter")
+            st.caption("Applies typed, parametric comparisons safely without unrestricted expression evaluation.")
+            q_col = st.selectbox("Filter Column", df.columns)
+            q_op = st.selectbox("Operator", ["==", "!=", ">", ">=", "<", "<=", "contains", "in"])
+            q_val = st.text_input("Comparison Value", "")
+
+            if q_val and st.button("Apply Structured Filter"):
                 try:
-                    st.session_state.df = filter_rows(df, q_expr, logger=logger)
-                    st.success("Query applied.")
+                    st.session_state.df = filter_rows_structured(df, column=q_col, operator=q_op, comparison_value=q_val, logger=logger)
+                    st.success("Filter applied.")
                     st.rerun()
                 except Exception as e:
-                    st.error(f"Query error: {str(e)}")
+                    st.error(f"Filter error: {str(e)}")
 
 
 # ==============================================================================
@@ -579,7 +627,7 @@ elif active_workspace == "3. Advanced Data Wrangling":
 # ==============================================================================
 elif active_workspace == "4. Statistics & Hypothesis Testing":
     st.subheader("Statistical Analysis & Hypothesis Validation")
-    st.caption("Descriptive statistics, correlation analysis, parametric/non-parametric tests, and distribution fitting.")
+    st.caption("Descriptive statistics, pairwise correlations, VIF multicollinearity, parametric/non-parametric tests, and distribution fitting.")
 
     if st.session_state.df is None:
         st.info("Please load a dataset in Workspace 1 first.")
@@ -589,7 +637,7 @@ elif active_workspace == "4. Statistics & Hypothesis Testing":
         cat_cols = [c for c in df.columns if isinstance(df[c].dtype, (pd.CategoricalDtype, pd.StringDtype)) or df[c].dtype == "object"]
 
         s_tab1, s_tab2, s_tab3, s_tab4, s_tab5 = st.tabs([
-            "Descriptive Stats", "Correlations & Warnings", "T-Tests & ANOVA", "Categorical Tests", "Distribution Fitting"
+            "Descriptive Stats", "Correlations & VIF", "T-Tests & ANOVA", "Categorical Tests", "Distribution Fitting"
         ])
 
         with s_tab1:
@@ -609,13 +657,18 @@ elif active_workspace == "4. Statistics & Hypothesis Testing":
             if not corr_m.empty:
                 st.dataframe(corr_m, use_container_width=True)
 
-            st.markdown("##### Multi-Collinearity Alerts (Threshold > 0.80)")
-            warnings_list = detect_multicollinearity(df, threshold=0.80)
-            if warnings_list:
-                for w in warnings_list:
-                    st.warning(f"{w['severity']} Collinearity: `{w['column_1']}` and `{w['column_2']}` (Coeff: {w['correlation']})")
+            st.markdown("##### Highly Correlated Feature Pairs (Pairwise Correlation >= 0.80)")
+            corr_pairs = detect_highly_correlated_pairs(df, threshold=0.80)
+            if corr_pairs:
+                for w in corr_pairs:
+                    st.warning(f"{w['severity']} Correlation: `{w['column_1']}` and `{w['column_2']}` (Coeff: {w['correlation']})")
             else:
-                st.success("No collinearity issues detected among numerical predictors.")
+                st.success("No feature pairs exceed the 0.80 correlation threshold.")
+
+            st.markdown("##### Variance Inflation Factor (VIF) Multi-Collinearity Calculation")
+            vif_df = compute_variance_inflation_factors(df)
+            if not vif_df.empty:
+                st.dataframe(vif_df, use_container_width=True)
 
         with s_tab3:
             st.markdown("##### T-Tests & One-Way ANOVA")
@@ -627,7 +680,7 @@ elif active_workspace == "4. Statistics & Hypothesis Testing":
                     tt_s2 = st.selectbox("Sample 2", num_cols, index=1)
                     tt_type = st.selectbox("Type", ["independent", "paired"])
                     if st.button("Run T-Test"):
-                        res_tt = run_t_test(df[tt_s1].values, df[tt_s2].values, test_type=tt_type)
+                        res_tt = run_t_test(df[tt_s1], df[tt_s2], test_type=tt_type)
                         st.json(res_tt)
 
             with t_col2:
@@ -678,7 +731,7 @@ elif active_workspace == "4. Statistics & Hypothesis Testing":
 # ==============================================================================
 elif active_workspace == "5. Time-Series & Math Modeling":
     st.subheader("Time-Series & Mathematical Modeling")
-    st.caption("Temporal decomposition, curve fitting trendlines, genetic symbolic regression, clustering, PCA, and anomaly detection.")
+    st.caption("Temporal decomposition, curve fitting trendlines, parametric function-family search, clustering with inverse centers, and PCA loadings.")
 
     if st.session_state.df is None:
         st.info("Please load a dataset in Workspace 1 first.")
@@ -688,7 +741,7 @@ elif active_workspace == "5. Time-Series & Math Modeling":
         num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
 
         m_tab1, m_tab2, m_tab3, m_tab4, m_tab5 = st.tabs([
-            "Time-Series Analysis", "Curve Fitting", "Symbolic Regression", "K-Means & PCA", "Isolation Forest"
+            "Time-Series Analysis", "Curve Fitting", "Parametric Function Search", "K-Means & PCA", "Isolation Forest"
         ])
 
         with m_tab1:
@@ -720,7 +773,7 @@ elif active_workspace == "5. Time-Series & Math Modeling":
                     st.markdown("**Moving Averages & Decomposition**")
                     w_size = st.slider("Moving Window", 2, 60, 7)
                     if st.button("Rolling Metrics"):
-                        r_df = compute_rolling_metrics(df, ts_val, window_size=w_size)
+                        r_df = compute_rolling_metrics(df, ts_val, date_column=ts_dt, window_size=w_size)
                         fig_roll = create_relationship_chart(r_df, ts_dt, f"{ts_val}_rolling_mean_{w_size}", chart_type="line")
                         st.plotly_chart(fig_roll, use_container_width=True)
 
@@ -739,22 +792,22 @@ elif active_workspace == "5. Time-Series & Math Modeling":
                     register_figure(fig_cf)
 
         with m_tab3:
-            st.markdown("##### Vectorized Symbolic Regression")
-            st.caption("Evolves mathematical laws rapidly across functional bases using genetic algorithms.")
+            st.markdown("##### Parametric Function-Family Search")
+            st.caption("Evolves mathematical laws across functional families using bounded genetic optimization.")
             if len(num_cols) >= 2:
                 sr_x = st.selectbox("Symbolic X", num_cols, index=0)
                 sr_y = st.selectbox("Symbolic Y", num_cols, index=1)
-                sr_gen = st.slider("Generations", 5, 40, 15)
-                sr_pop = st.slider("Population", 20, 80, 40)
+                sr_gen = st.slider("Generations", 5, 30, 15)
+                sr_pop = st.slider("Population", 20, 60, 40)
 
                 if st.button("Discover Equation"):
-                    with st.spinner("Executing genetic optimization..."):
+                    with st.spinner("Executing function-family search..."):
                         sr_res = run_symbolic_regression(df, sr_x, sr_y, generations=sr_gen, population_size=sr_pop)
                         st.success(f"Discovered Equation: **{sr_res['equation']}** (Family: {sr_res['basis_family']})")
                         st.write(f"R²: **{sr_res['r_squared']}** | MSE: **{sr_res['mse']}**")
 
         with m_tab4:
-            st.markdown("##### K-Means Clustering & PCA")
+            st.markdown("##### K-Means Clustering & PCA with Loadings")
             if len(num_cols) >= 2:
                 col_km, col_pca = st.columns(2)
                 with col_km:
@@ -764,6 +817,8 @@ elif active_workspace == "5. Time-Series & Math Modeling":
                     if km_feats and st.button("Run K-Means"):
                         km_df, km_meta = run_kmeans_clustering(df, km_feats, n_clusters=km_k)
                         st.write(f"Inertia: {km_meta['inertia']}")
+                        st.markdown("**Cluster Centers (Original Units)**")
+                        st.dataframe(km_meta["centers_dataframe"], use_container_width=True)
                         fig_km = create_relationship_chart(km_df, km_feats[0], km_feats[1], chart_type="scatter", color_col="Cluster")
                         st.plotly_chart(fig_km, use_container_width=True)
                         register_figure(fig_km)
@@ -775,6 +830,8 @@ elif active_workspace == "5. Time-Series & Math Modeling":
                     if len(pca_feats) >= pca_c and st.button("Run PCA"):
                         pca_df, pca_meta = run_pca_reduction(df, pca_feats, n_components=pca_c)
                         st.write(f"Explained Variance: {pca_meta['total_explained_variance']}%")
+                        st.markdown("**Feature Loadings**")
+                        st.dataframe(pca_meta["loadings"], use_container_width=True)
                         fig_pca = create_relationship_chart(pca_df, "PC1", "PC2", chart_type="scatter")
                         st.plotly_chart(fig_pca, use_container_width=True)
 
@@ -805,7 +862,7 @@ elif active_workspace == "6. Visualization Studio & Reports":
         logger = st.session_state.audit_logger
 
         v_tab1, v_tab2, v_tab3, v_tab4 = st.tabs([
-            "Visualization Studio", "Custom Chart Builder", "Executive Narrative", "Report & Dataset Export"
+            "Visualization Studio", "Custom Chart Builder", "Automated Executive Summary", "Report & Dataset Export"
         ])
 
         with v_tab1:
@@ -828,7 +885,8 @@ elif active_workspace == "6. Visualization Studio & Reports":
                 register_figure(built_f)
 
         with v_tab3:
-            st.markdown("##### Automated AI Executive Summary")
+            st.markdown("##### Automated Executive Summary")
+            st.caption("Deterministic analytical narrative generated from dataset distributions and transformation records.")
             exec_text = generate_executive_summary(df, audit_logs=logger.get_logs())
             st.markdown(exec_text)
 

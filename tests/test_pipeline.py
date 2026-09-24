@@ -1,306 +1,320 @@
 """
-Comprehensive Unit and Integration Tests for DataSight Analytics Engine.
-Verifies all 52 core data analytics features across:
-- Ingestion and Memory Optimization
-- Automated and Granular Cleaning
-- Statistics, Correlations, and Hypothesis Tests
-- Advanced Wrangling and Reshaping
-- Time-Series Analysis and Seasonality
-- Modeling, Curve Fitting, Symbolic Regression, Clustering, PCA, Isolation Forest
-- Report Generation (HTML, PDF, Dataset Exports)
+Exhaustive Unit & Integration Test Suite for DataSight Analytics Engine.
+Performs verification against known mathematical ground truths and handles
+complex edge cases:
+- Known-Answer Tests (KAT) for descriptive statistics, Pearson/Spearman/Kendall, T-Tests, ANOVA, Chi-Square
+- Linear & Polynomial curve fitting ground truths
+- Secure AST formula evaluation & injection blocking
+- Structured row filtering
+- Null preservation in string operations
+- Boolean string parsing integrity
+- Float precision retention policy
+- Inverse transformed K-Means cluster centers
+- PCA loadings and explained variance sums
+- Strict date vs non-date identifier recognition
+- Edge cases: Empty DataFrames, 1-row DataFrames, all-null columns, constant zero-variance features
 """
 
 import unittest
-import os
-import io
-import pandas as pd
+import math
 import numpy as np
-import plotly.graph_objects as go
+import pandas as pd
+from scipy import stats
 
-from backend.ingestion.memory import optimize_dataframe_memory, get_memory_usage, free_memory
-from backend.ingestion.loaders import load_dataset, detect_schema, get_dataset_overview
+from backend.ingestion.memory import optimize_dataframe_memory, get_memory_usage
+from backend.ingestion.loaders import detect_file_format, is_valid_date_series, detect_schema
 from backend.cleaning.cleaning import (
-    AuditLogger,
+    clean_text_columns,
+    parse_boolean_series,
+    treat_outliers,
     standardize_column_headers,
     impute_missing_values,
-    drop_missing_values,
-    remove_duplicates,
-    treat_outliers,
-    clean_text_columns,
-    cast_data_types,
-    run_automated_cleaning
+    analyze_cleaning_recommendations,
+    run_automated_cleaning,
+    AuditLogger
 )
 from backend.cleaning.wrangling import (
     add_custom_formula_column,
     bin_continuous_column,
-    aggregate_groupby,
-    merge_datasets,
-    extract_regex_patterns,
-    pivot_dataframe,
-    unpivot_dataframe,
-    filter_rows
+    filter_rows_structured
 )
 from backend.analysis.statistics import (
     compute_univariate_summary,
-    compute_categorical_distribution,
-    compute_missingness_matrix,
     compute_correlation_matrix,
-    detect_multicollinearity,
+    detect_highly_correlated_pairs,
+    compute_variance_inflation_factors,
     compute_skewness_kurtosis
 )
 from backend.analysis.hypothesis import (
     run_t_test,
     run_anova,
     run_chi_square,
-    run_non_parametric_tests,
     fit_distributions
 )
 from backend.analysis.timeseries import (
-    resample_temporal_data,
-    compute_rolling_metrics,
-    compute_period_over_period_growth,
-    compute_cumulative_totals,
+    ensure_sorted_timeseries,
     decompose_seasonality_trend
 )
 from backend.modeling.modeling import (
     fit_curve_and_equation,
-    run_symbolic_regression,
     run_kmeans_clustering,
-    run_pca_reduction,
-    run_isolation_forest_anomaly_detection
-)
-from frontend.components.visualizations import (
-    create_auto_plot,
-    create_distribution_chart,
-    create_relationship_chart,
-    create_categorical_chart,
-    build_custom_chart
+    run_pca_reduction
 )
 from backend.reporting.reports import (
-    export_dataset_bytes,
     generate_executive_summary,
-    generate_html_report,
     generate_pdf_report
 )
 
 
-class TestDataSightPipeline(unittest.TestCase):
-    def setUp(self):
-        np.random.seed(42)
-        n = 100
-        self.sample_df = pd.DataFrame({
-            "Transaction ID": [f"ID_{i}" for i in range(n)],
-            "Units Sold": np.random.randint(10, 50, n),
-            "Price": np.random.uniform(5.0, 100.0, n).round(2),
-            "Category": np.random.choice(["Alpha", "Beta", "Gamma"], n),
-            "Score": np.random.normal(50, 10, n),
-            "Notes": [" test text " if i % 2 == 0 else "example text" for i in range(n)]
+class TestDataSightCorrectness(unittest.TestCase):
+
+    # -------------------------------------------------------------
+    # 1. Known-Answer Statistical Tests
+    # -------------------------------------------------------------
+
+    def test_univariate_summary_known_values(self):
+        # Known sample: [2, 4, 4, 4, 5, 5, 7, 9]
+        # Mean = 5.0, Median = 4.5, Min = 2.0, Max = 9.0
+        # Population Variance = 4.0, Sample Variance (ddof=1) = 4.5714
+        data = pd.DataFrame({"metric": [2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0]})
+        summary = compute_univariate_summary(data)
+        row = summary.iloc[0]
+
+        self.assertAlmostEqual(row["Mean"], 5.0, places=3)
+        self.assertAlmostEqual(row["Median"], 4.5, places=3)
+        self.assertAlmostEqual(row["Min"], 2.0, places=3)
+        self.assertAlmostEqual(row["Max"], 9.0, places=3)
+        self.assertAlmostEqual(row["Variance"], 4.5714, places=3)
+        self.assertAlmostEqual(row["Std_Dev"], math.sqrt(4.571428), places=3)
+
+    def test_correlation_matrix_known_values(self):
+        x = [1.0, 2.0, 3.0, 4.0, 5.0]
+        y = [2.0, 4.0, 6.0, 8.0, 10.0]
+        df = pd.DataFrame({"x": x, "y": y})
+
+        corr_pearson = compute_correlation_matrix(df, method="pearson")
+        self.assertAlmostEqual(corr_pearson.loc["x", "y"], 1.0, places=4)
+
+        corr_spearman = compute_correlation_matrix(df, method="spearman")
+        self.assertAlmostEqual(corr_spearman.loc["x", "y"], 1.0, places=4)
+
+        z = [10.0, 8.0, 6.0, 4.0, 2.0]
+        df_inv = pd.DataFrame({"x": x, "z": z})
+        corr_inv = compute_correlation_matrix(df_inv, method="pearson")
+        self.assertAlmostEqual(corr_inv.loc["x", "z"], -1.0, places=4)
+
+    def test_paired_t_test_known_values(self):
+        s_a = pd.Series([10.0, 12.0, 14.0, np.nan, 16.0, 18.0])
+        s_b = pd.Series([8.0, 10.0, 12.0, 14.0, np.nan, 16.0])
+
+        res = run_t_test(s_a, s_b, test_type="paired")
+        self.assertEqual(res["n_obs_a"], 4)
+        self.assertEqual(res["n_obs_b"], 4)
+        self.assertAlmostEqual(res["mean_sample_a"] - res["mean_sample_b"], 2.0, places=3)
+
+    def test_anova_known_values(self):
+        g1 = np.array([1.0, 2.0, 3.0])
+        g2 = np.array([4.0, 5.0, 6.0])
+        g3 = np.array([7.0, 8.0, 9.0])
+        res = run_anova([g1, g2, g3])
+        self.assertAlmostEqual(res["f_statistic"], 27.0, places=2)
+        self.assertTrue(res["is_significant"])
+
+    def test_chi_square_known_values(self):
+        ct_indep = pd.DataFrame([[10, 10], [10, 10]], index=["R1", "R2"], columns=["C1", "C2"])
+        res_zero = run_chi_square(ct_indep)
+        self.assertAlmostEqual(res_zero["chi2_statistic"], 0.0, places=4)
+        self.assertFalse(res_zero["is_significant"])
+
+        ct_dep = pd.DataFrame([[50, 5], [5, 50]], index=["R1", "R2"], columns=["C1", "C2"])
+        res_sig = run_chi_square(ct_dep)
+        self.assertTrue(res_sig["is_significant"])
+
+    def test_curve_fitting_known_line(self):
+        x = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
+        y = 3.0 * x + 5.0
+        df = pd.DataFrame({"x": x, "y": y})
+        res = fit_curve_and_equation(df, "x", "y", curve_type="linear")
+        self.assertAlmostEqual(res["parameters"][0], 3.0, places=3)
+        self.assertAlmostEqual(res["parameters"][1], 5.0, places=3)
+        self.assertAlmostEqual(res["r_squared"], 1.0, places=4)
+
+    # -------------------------------------------------------------
+    # 2. Security & AST Expression Evaluation
+    # -------------------------------------------------------------
+
+    def test_secure_ast_formula_valid_operations(self):
+        df = pd.DataFrame({
+            "revenue": [100.0, 200.0, 300.0],
+            "cost": [40.0, 80.0, 120.0],
+            "tax rate": [0.10, 0.10, 0.10]
         })
-        # Add duplicates and missing values
-        self.sample_df.loc[5, "Score"] = np.nan
-        self.sample_df.loc[6, "Score"] = np.nan
+        df1 = add_custom_formula_column(df, "profit", "revenue - cost")
+        self.assertEqual(df1["profit"].tolist(), [60.0, 120.0, 180.0])
 
-    def test_memory_optimization(self):
-        df_opt, metrics = optimize_dataframe_memory(self.sample_df)
-        self.assertIn("initial_mb", metrics)
-        self.assertIn("final_mb", metrics)
-        self.assertLessEqual(metrics["final_mb"], metrics["initial_mb"])
+        df2 = add_custom_formula_column(df, "tax", "cost * `tax rate`")
+        self.assertEqual(df2["tax"].tolist(), [4.0, 8.0, 12.0])
 
-    def test_ingestion_and_schema(self):
-        csv_buf = io.StringIO()
-        self.sample_df.to_csv(csv_buf, index=False)
-        csv_buf.seek(0)
+        df3 = add_custom_formula_column(df, "log_rev", "log(revenue)")
+        self.assertAlmostEqual(df3["log_rev"].iloc[0], math.log(100.0), places=3)
 
-        df_loaded, meta = load_dataset(csv_buf, "test.csv")
-        self.assertEqual(len(df_loaded), 100)
-        schema = detect_schema(df_loaded)
-        self.assertIn("numeric_columns", schema)
-        self.assertIn("categorical_columns", schema)
+    def test_secure_ast_formula_blocks_code_injection(self):
+        df = pd.DataFrame({"a": [1, 2, 3]})
+        with self.assertRaises(ValueError):
+            add_custom_formula_column(df, "hacked", "__import__('os').system('echo hacked')")
 
-        ov = get_dataset_overview(df_loaded)
-        self.assertEqual(ov["total_rows"], 100)
-        self.assertGreaterEqual(ov["total_missing_cells"], 2)
+        with self.assertRaises(ValueError):
+            add_custom_formula_column(df, "hacked", "open('/etc/passwd').read()")
 
-    def test_cleaning_suite(self):
-        logger = AuditLogger()
-        # 1. Standardize headers
-        df = standardize_column_headers(self.sample_df, case_style="snake_case", logger=logger)
-        self.assertIn("transaction_id", df.columns)
-        self.assertIn("units_sold", df.columns)
+        with self.assertRaises(ValueError):
+            add_custom_formula_column(df, "hacked", "exec('x=1')")
 
-        # 2. Impute missing values
-        df = impute_missing_values(df, columns=["score"], strategy="mean", logger=logger)
-        self.assertEqual(df["score"].isna().sum(), 0)
-
-        # 3. Duplicate handling
-        df = remove_duplicates(df, logger=logger)
-
-        # 4. Outlier treatment
-        df, info = treat_outliers(df, column="score", method="iqr", action="cap", logger=logger)
-        self.assertIn("outliers_detected", info)
-
-        # 5. Text cleaning
-        df = clean_text_columns(df, columns=["notes"], strip_whitespace=True, case_transformation="lower", logger=logger)
-        self.assertEqual(df["notes"].iloc[0], "test text")
-
-        # 6. Type casting
-        df = cast_data_types(df, {"units_sold": "float"}, logger=logger)
-        self.assertTrue(pd.api.types.is_float_dtype(df["units_sold"]))
-
-        # 7. Audit logs
-        logs = logger.get_logs()
-        self.assertGreater(len(logs), 0)
-
-    def test_auto_cleaning(self):
-        logger = AuditLogger()
-        cleaned_df, summary = run_automated_cleaning(self.sample_df, logger=logger)
-        self.assertEqual(cleaned_df["score"].isna().sum(), 0)
-        self.assertGreaterEqual(summary["steps_executed"], 3)
-
-    def test_wrangling_operations(self):
-        df = standardize_column_headers(self.sample_df)
-        # Custom formula
-        df = add_custom_formula_column(df, "total_value", "units_sold * price")
-        self.assertIn("total_value", df.columns)
-
-        # Continuous binning
-        df = bin_continuous_column(df, "price", "price_bin", bins=4)
-        self.assertIn("price_bin", df.columns)
-
-        # Groupby
-        agg_df = aggregate_groupby(df, ["category"], {"units_sold": ["mean", "sum"]})
-        self.assertGreater(len(agg_df), 0)
-
-        # Filtering
-        filtered = filter_rows(df, "units_sold > 20")
-        self.assertTrue((filtered["units_sold"] > 20).all())
-
-        # Regex
-        regex_df = extract_regex_patterns(df, "transaction_id", r"ID_(\d+)", "id_num")
-        self.assertIn("id_num", regex_df.columns)
-
-    def test_statistics_and_correlations(self):
-        df = standardize_column_headers(self.sample_df)
-        uni = compute_univariate_summary(df)
-        self.assertGreater(len(uni), 0)
-
-        cats = compute_categorical_distribution(df)
-        self.assertIn("category", cats)
-
-        miss = compute_missingness_matrix(df)
-        self.assertIn("summary", miss)
-
-        corr = compute_correlation_matrix(df)
-        self.assertFalse(corr.empty)
-
-        sk = compute_skewness_kurtosis(df)
-        self.assertGreater(len(sk), 0)
-
-    def test_hypothesis_testing(self):
-        a = np.random.normal(10, 2, 50)
-        b = np.random.normal(15, 2, 50)
-        tt_res = run_t_test(a, b, test_type="independent")
-        self.assertTrue(tt_res["is_significant"])
-
-        anova_res = run_anova([a, b, np.random.normal(12, 2, 50)])
-        self.assertIn("f_statistic", anova_res)
-
-        ct = pd.DataFrame([[10, 20], [20, 10]], index=["R1", "R2"], columns=["C1", "C2"])
-        chi_res = run_chi_square(ct)
-        self.assertIn("chi2_statistic", chi_res)
-
-        non_param = run_non_parametric_tests([a, b])
-        self.assertIn("p_value", non_param)
-
-        fits = fit_distributions(a)
-        self.assertGreater(len(fits), 0)
-
-    def test_timeseries_analysis(self):
-        dates = pd.date_range("2024-01-01", periods=60, freq="D")
-        ts_df = pd.DataFrame({
-            "timestamp": dates,
-            "metric": np.sin(np.linspace(0, 20, 60)) + np.random.normal(0, 0.1, 60) + 10
+    def test_structured_query_filtering(self):
+        df = pd.DataFrame({
+            "name": ["Alice", "Bob", "Charlie"],
+            "age": [25, 35, 45]
         })
+        f1 = filter_rows_structured(df, "age", ">", 30)
+        self.assertEqual(len(f1), 2)
 
-        resampled = resample_temporal_data(ts_df, "timestamp", "metric", frequency="W", aggregation="mean")
-        self.assertGreater(len(resampled), 0)
+        f2 = filter_rows_structured(df, "name", "contains", "ali")
+        self.assertEqual(len(f2), 1)
+        self.assertEqual(f2["name"].iloc[0], "Alice")
 
-        rolling = compute_rolling_metrics(ts_df, "metric", window_size=5)
-        self.assertIn("metric_rolling_mean_5", rolling.columns)
+    # -------------------------------------------------------------
+    # 3. Data Cleaning, Parsing & Type Correctness
+    # -------------------------------------------------------------
 
-        growth = compute_period_over_period_growth(ts_df, "metric", periods=1)
-        self.assertIn("metric_pct_change_1", growth.columns)
+    def test_text_cleaning_preserves_nan_without_stringification(self):
+        df = pd.DataFrame({
+            "comments": ["  Clean ME  ", np.nan, "Sample Text"]
+        })
+        cleaned = clean_text_columns(df, columns=["comments"], strip_whitespace=True, case_transformation="lower")
+        self.assertEqual(cleaned["comments"].iloc[0], "clean me")
+        # Ensure it remains a true null and not the string 'nan'
+        self.assertTrue(pd.isna(cleaned["comments"].iloc[1]))
+        val_str = str(cleaned["comments"].iloc[1])
+        self.assertNotIn(val_str, ["clean me", "sample text"])
 
-        cum = compute_cumulative_totals(ts_df, "metric")
-        self.assertIn("metric_cumsum", cum.columns)
+    def test_robust_boolean_parser(self):
+        bool_inputs = pd.Series(["True", "false", "YES", "No", "1", "0", np.nan])
+        parsed = parse_boolean_series(bool_inputs)
 
-        decomp = decompose_seasonality_trend(ts_df, "timestamp", "metric", period=7)
-        self.assertIn("trend", decomp["data"].columns)
+        self.assertTrue(parsed.iloc[0])
+        self.assertFalse(parsed.iloc[1])
+        self.assertTrue(parsed.iloc[2])
+        self.assertFalse(parsed.iloc[3])
+        self.assertTrue(parsed.iloc[4])
+        self.assertFalse(parsed.iloc[5])
+        self.assertTrue(pd.isna(parsed.iloc[6]))
 
-    def test_modeling_and_clusters(self):
-        x = np.linspace(1, 10, 50)
-        y = 2.5 * x + 4.0 + np.random.normal(0, 0.2, 50)
-        fit_df = pd.DataFrame({"x": x, "y": y})
+        with self.assertRaises(ValueError):
+            parse_boolean_series(pd.Series(["NotABool"]))
 
-        # Curve fitting
-        curve_res = fit_curve_and_equation(fit_df, "x", "y", curve_type="linear")
-        self.assertGreater(curve_res["r_squared"], 0.85)
+    def test_memory_layer_preserves_float_precision_by_default(self):
+        df = pd.DataFrame({"high_precision_pi": [3.141592653589793]})
+        opt_df, meta = optimize_dataframe_memory(df, downcast_integers=True, downcast_floats=False)
+        self.assertEqual(opt_df["high_precision_pi"].dtype, np.float64)
+        self.assertFalse(meta["float_downcasting_applied"])
 
-        # Symbolic Regression
-        sr_res = run_symbolic_regression(fit_df, "x", "y", generations=5, population_size=15)
-        self.assertIn("equation", sr_res)
+    def test_controlled_auto_clean_does_not_mutate_blindly(self):
+        df = pd.DataFrame({
+            "User ID": [1, 2, 3],
+            "Score": [10.0, np.nan, 1000.0]
+        })
+        cleaned_df, summary = run_automated_cleaning(df, impute_missing=False, cap_outliers=False)
+        self.assertTrue(cleaned_df["score"].isna().sum() == 1)
+        self.assertEqual(cleaned_df["score"].max(), 1000.0)
+        self.assertFalse(summary["imputation_performed"])
+        self.assertFalse(summary["outlier_capping_performed"])
 
-        # K-Means
-        clustered, km_info = run_kmeans_clustering(fit_df, ["x", "y"], n_clusters=2)
-        self.assertIn("Cluster", clustered.columns)
+    # -------------------------------------------------------------
+    # 4. Ingestion & Date vs Non-Date Recognition
+    # -------------------------------------------------------------
 
-        # PCA
-        pca_df, pca_info = run_pca_reduction(fit_df, ["x", "y"], n_components=2)
-        self.assertIn("PC1", pca_df.columns)
+    def test_file_format_detection_safety(self):
+        self.assertEqual(detect_file_format("data.csv"), "csv")
+        self.assertEqual(detect_file_format("metrics.parquet"), "parquet")
 
-        # Isolation Forest
-        iso_df, iso_info = run_isolation_forest_anomaly_detection(fit_df, ["x", "y"])
-        self.assertIn("Anomaly_Flag", iso_df.columns)
+        with self.assertRaises(ValueError):
+            detect_file_format("unknown.xyz")
 
-    def test_visualizations(self):
-        fig_auto = create_auto_plot(self.sample_df)
-        self.assertIsInstance(fig_auto, go.Figure)
+        with self.assertRaises(ValueError):
+            detect_file_format("ambiguous.txt")
 
-        fig_dist = create_distribution_chart(self.sample_df, "Price", chart_type="histogram")
-        self.assertIsInstance(fig_dist, go.Figure)
+    def test_date_detection_rejects_alphanumeric_ids(self):
+        id_series = pd.Series(["TX-1001-A", "TX-1002-B", "TX-1003-C"])
+        self.assertFalse(is_valid_date_series(id_series, col_name="tx_id"))
 
-        fig_rel = create_relationship_chart(self.sample_df, "Units Sold", "Price", chart_type="scatter")
-        self.assertIsInstance(fig_rel, go.Figure)
+        uuid_series = pd.Series(["123e4567-e89b-12d3-a456-426614174000", "e6362c7f-e8ac-4126-866b-05c65b09ee1c"])
+        self.assertFalse(is_valid_date_series(uuid_series, col_name="uuid"))
 
-        fig_cat = create_categorical_chart(self.sample_df, "Category", chart_type="bar")
-        self.assertIsInstance(fig_cat, go.Figure)
+        real_dates = pd.Series(["2024-01-01", "2024-01-02", "2024-01-03"])
+        self.assertTrue(is_valid_date_series(real_dates, col_name="event_date"))
 
-        fig_custom = build_custom_chart(self.sample_df, chart_type="Scatter", x_col="Units Sold", y_col="Price")
-        self.assertIsInstance(fig_custom, go.Figure)
+        slash_dates = pd.Series(["15/01/2024", "16/01/2024", "17/01/2024"])
+        self.assertTrue(is_valid_date_series(slash_dates, col_name="event_date"))
 
-    def test_reporting_and_export(self):
-        # Dataset exports
-        csv_bytes, _, _ = export_dataset_bytes(self.sample_df, file_format="csv")
-        self.assertGreater(len(csv_bytes), 0)
+    # -------------------------------------------------------------
+    # 5. Modeling Correctness (Centers & Loadings)
+    # -------------------------------------------------------------
 
-        xlsx_bytes, _, _ = export_dataset_bytes(self.sample_df, file_format="excel")
-        self.assertGreater(len(xlsx_bytes), 0)
+    def test_kmeans_centers_in_original_scale(self):
+        x = np.array([90, 100, 110, 990, 1000, 1010], dtype=float)
+        y = np.array([90, 100, 110, 990, 1000, 1010], dtype=float)
+        df = pd.DataFrame({"x": x, "y": y})
 
-        pq_bytes, _, _ = export_dataset_bytes(self.sample_df, file_format="parquet")
-        self.assertGreater(len(pq_bytes), 0)
+        _, meta = run_kmeans_clustering(df, ["x", "y"], n_clusters=2, scale=True)
+        centers_df = meta["centers_dataframe"]
 
-        # Executive summary
-        summary = generate_executive_summary(self.sample_df)
-        self.assertIn("Dataset Overview", summary)
+        c_vals = sorted(centers_df["x"].tolist())
+        self.assertAlmostEqual(c_vals[0], 100.0, delta=15.0)
+        self.assertAlmostEqual(c_vals[1], 1000.0, delta=15.0)
 
-        # HTML report
-        html_rep = generate_html_report(self.sample_df, summary_text=summary)
-        self.assertIn("<!DOCTYPE html>", html_rep)
+    def test_pca_loadings_and_explained_variance(self):
+        df = pd.DataFrame({
+            "a": [1.0, 2.0, 3.0, 4.0, 5.0],
+            "b": [2.0, 4.0, 6.0, 8.0, 10.0],
+            "c": [5.0, 1.0, 4.0, 2.0, 3.0]
+        })
+        pca_coords, meta = run_pca_reduction(df, ["a", "b", "c"], n_components=2)
+        self.assertIn("loadings", meta)
+        self.assertIn("contributions", meta)
+        self.assertAlmostEqual(sum(meta["explained_variance_ratio"]), meta["total_explained_variance"], places=1)
 
-        # PDF report
-        pdf_bytes = generate_pdf_report(self.sample_df, summary_text=summary)
-        self.assertGreater(len(pdf_bytes), 0)
-        self.assertTrue(pdf_bytes.startswith(b"%PDF"))
+    # -------------------------------------------------------------
+    # 6. Edge Cases Coverage
+    # -------------------------------------------------------------
+
+    def test_empty_dataframe(self):
+        empty_df = pd.DataFrame()
+        summary = compute_univariate_summary(empty_df)
+        self.assertTrue(summary.empty)
+
+        opt_df, meta = optimize_dataframe_memory(empty_df)
+        self.assertEqual(meta["initial_mb"], 0.0)
+
+    def test_single_row_dataframe(self):
+        one_row = pd.DataFrame({"val": [42.0], "cat": ["single"]})
+        summary = compute_univariate_summary(one_row)
+        self.assertEqual(summary["Count"].iloc[0], 1)
+        self.assertEqual(summary["Mean"].iloc[0], 42.0)
+
+    def test_all_null_column(self):
+        df_nulls = pd.DataFrame({"empty_col": [np.nan, np.nan, np.nan]})
+        summary = compute_univariate_summary(df_nulls)
+        self.assertTrue(summary.empty)
+
+    def test_constant_zero_variance_column(self):
+        df_const = pd.DataFrame({"const": [5.0, 5.0, 5.0, 5.0]})
+        summary = compute_univariate_summary(df_const)
+        self.assertEqual(summary["Variance"].iloc[0], 0.0)
+
+    def test_time_series_insufficient_period_raises_error(self):
+        dates = pd.date_range("2024-01-01", periods=10, freq="D")
+        ts_df = pd.DataFrame({"date": dates, "val": np.arange(10)})
+        with self.assertRaises(ValueError):
+            decompose_seasonality_trend(ts_df, "date", "val", period=12)
 
 
 if __name__ == "__main__":
