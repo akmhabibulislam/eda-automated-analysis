@@ -25,27 +25,21 @@ def create_auto_plot(df: pd.DataFrame) -> go.Figure:
     Recommends and builds charts based on detected column data types.
     """
     num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-    cat_cols = df.select_dtypes(include=["object", "category"]).columns.tolist()
+    cat_cols = [c for c in df.columns if isinstance(df[c].dtype, (pd.CategoricalDtype, pd.StringDtype)) or df[c].dtype == "object"]
     dt_cols = df.select_dtypes(include=["datetime", "datetimetz"]).columns.tolist()
 
     if dt_cols and num_cols:
-        # Time-series trend
         fig = px.line(df, x=dt_cols[0], y=num_cols[0], title=f"Auto Trend: {num_cols[0]} over {dt_cols[0]}", template=THEME_TEMPLATE)
     elif len(num_cols) >= 2 and cat_cols:
-        # Scatter with category color
         fig = px.scatter(df, x=num_cols[0], y=num_cols[1], color=cat_cols[0], title=f"Auto Relationship: {num_cols[0]} vs {num_cols[1]} by {cat_cols[0]}", template=THEME_TEMPLATE)
     elif len(num_cols) >= 2:
-        # 2D Scatter
         fig = px.scatter(df, x=num_cols[0], y=num_cols[1], title=f"Auto Relationship: {num_cols[0]} vs {num_cols[1]}", template=THEME_TEMPLATE)
     elif cat_cols and num_cols:
-        # Categorical bar
         agg_df = df.groupby(cat_cols[0])[num_cols[0]].mean().reset_index().head(20)
         fig = px.bar(agg_df, x=cat_cols[0], y=num_cols[0], title=f"Auto Summary: Mean {num_cols[0]} by {cat_cols[0]}", template=THEME_TEMPLATE)
     elif num_cols:
-        # Distribution histogram
         fig = px.histogram(df, x=num_cols[0], marginal="box", title=f"Auto Distribution: {num_cols[0]}", template=THEME_TEMPLATE)
     elif cat_cols:
-        # Value count bar chart
         vc = df[cat_cols[0]].value_counts().head(20).reset_index()
         vc.columns = [cat_cols[0], "Count"]
         fig = px.bar(vc, x=cat_cols[0], y="Count", title=f"Auto Frequency: {cat_cols[0]}", template=THEME_TEMPLATE)
@@ -60,7 +54,7 @@ def create_auto_plot(df: pd.DataFrame) -> go.Figure:
 def create_distribution_chart(
     df: pd.DataFrame,
     column: str,
-    chart_type: str = "histogram",  # histogram, box, kde
+    chart_type: str = "histogram",
     color_col: Optional[str] = None,
     nbins: int = 30
 ) -> go.Figure:
@@ -87,7 +81,6 @@ def create_distribution_chart(
             template=THEME_TEMPLATE
         )
     elif chart_type == "kde":
-        # Density approximation with histogram probability density
         fig = px.histogram(
             df,
             x=column,
@@ -108,7 +101,7 @@ def create_relationship_chart(
     df: pd.DataFrame,
     x_col: str,
     y_col: str,
-    chart_type: str = "scatter",  # scatter, bubble, line
+    chart_type: str = "scatter",
     color_col: Optional[str] = None,
     size_col: Optional[str] = None
 ) -> go.Figure:
@@ -154,7 +147,7 @@ def create_categorical_chart(
     df: pd.DataFrame,
     cat_col: str,
     val_col: Optional[str] = None,
-    chart_type: str = "bar",  # bar, pie, violin
+    chart_type: str = "bar",
     aggregation: str = "mean"
 ) -> go.Figure:
     """
@@ -162,7 +155,7 @@ def create_categorical_chart(
     """
     if chart_type == "bar":
         if val_col:
-            grouped = df.groupby(cat_col)[val_col].agg(aggregation).reset_index().head(25)
+            grouped = df.groupby(cat_col, observed=False)[val_col].agg(aggregation).reset_index().head(25)
             fig = px.bar(
                 grouped,
                 x=cat_col,
@@ -227,7 +220,6 @@ def build_custom_chart(
 ) -> go.Figure:
     """
     Feature 46: Custom Chart Builder.
-    Allows manual axis selection, grouping, and chart type configuration.
     """
     if chart_type == "Scatter":
         fig = px.scatter(df, x=x_col, y=y_col, color=color_col, facet_col=facet_col, template=THEME_TEMPLATE)

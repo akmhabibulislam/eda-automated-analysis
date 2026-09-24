@@ -16,9 +16,6 @@ import datetime
 from typing import Dict, Any, List, Optional, Tuple, Union
 import pandas as pd
 import numpy as np
-from scipy import stats
-
-from backend.ingestion.memory import free_memory
 
 
 class AuditLogger:
@@ -66,7 +63,6 @@ def standardize_column_headers(
 
     for col in old_columns:
         c = str(col).strip()
-        # Replace non-alphanumeric chars with underscore
         c = re.sub(r"[^\w\s]", "", c)
         c = re.sub(r"[\s]+", "_", c)
 
@@ -126,8 +122,15 @@ def impute_missing_values(
         elif strategy == "mode":
             mode_vals = result[col].mode()
             if len(mode_vals) > 0:
-                result[col] = result[col].fillna(mode_vals[0])
+                fill_mode = mode_vals.iloc[0]
+                if isinstance(result[col].dtype, pd.CategoricalDtype):
+                    if fill_mode not in result[col].cat.categories:
+                        result[col] = result[col].cat.add_categories([fill_mode])
+                result[col] = result[col].fillna(fill_mode)
         elif strategy == "constant":
+            if isinstance(result[col].dtype, pd.CategoricalDtype):
+                if fill_value not in result[col].cat.categories:
+                    result[col] = result[col].cat.add_categories([fill_value])
             result[col] = result[col].fillna(fill_value)
         elif strategy == "ffill":
             result[col] = result[col].ffill()
@@ -159,12 +162,10 @@ def drop_missing_values(
     initial_rows = len(result)
     initial_cols = len(result.columns)
 
-    # Column-level threshold dropping: drop column if missing % > col_threshold_pct
     if col_threshold_pct is not None:
         col_thresh = (100.0 - col_threshold_pct) / 100.0 * initial_rows
         result = result.dropna(axis=1, thresh=int(col_thresh))
 
-    # Row-level threshold dropping: drop row if non-null count < row_thresh
     if row_threshold_pct is not None:
         total_cols = len(result.columns)
         row_thresh = int((100.0 - row_threshold_pct) / 100.0 * total_cols)
@@ -184,7 +185,6 @@ def drop_missing_values(
             rows_affected=rows_dropped,
             columns_affected=[]
         )
-    free_memory()
     return result
 
 
@@ -209,7 +209,6 @@ def remove_duplicates(
             rows_affected=rows_dropped,
             columns_affected=subset or list(df.columns)
         )
-    free_memory()
     return result
 
 
@@ -218,7 +217,7 @@ def treat_outliers(
     column: str,
     method: str = "iqr",
     threshold: float = 1.5,
-    action: str = "cap",  # cap, drop, or flag
+    action: str = "cap",
     logger: Optional[AuditLogger] = None
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     """
@@ -276,7 +275,6 @@ def treat_outliers(
             columns_affected=[column]
         )
 
-    free_memory()
     stats_info = {
         "method": method,
         "action": action,
@@ -292,12 +290,13 @@ def clean_text_columns(
     df: pd.DataFrame,
     columns: List[str],
     strip_whitespace: bool = True,
-    case_transformation: Optional[str] = None,  # lower, upper, title
+    case_transformation: Optional[str] = None,
     remove_special_chars: bool = False,
     logger: Optional[AuditLogger] = None
 ) -> pd.DataFrame:
     """
     Feature 11: Text & String Cleaning (whitespace trimming, capitalization fixes, special character stripping).
+    Safely handles both object/string dtypes and category dtypes without crashing or skipping.
     """
     result = df.copy()
 
@@ -305,6 +304,8 @@ def clean_text_columns(
         if col not in result.columns:
             continue
 
+        was_category = isinstance(result[col].dtype, pd.CategoricalDtype)
+        # Convert to string series for clean vectorized manipulations
         s = result[col].astype(str)
 
         if strip_whitespace:
@@ -320,7 +321,10 @@ def clean_text_columns(
         if remove_special_chars:
             s = s.apply(lambda x: re.sub(r"[^\w\s]", "", str(x)) if pd.notna(x) else x)
 
-        result[col] = s
+        if was_category:
+            result[col] = s.astype("category")
+        else:
+            result[col] = s
 
     if logger:
         logger.log(
@@ -380,7 +384,9 @@ def run_automated_cleaning(
     logger: Optional[AuditLogger] = None
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     """
-    Comprehensive one-click Auto-Clean execution covering all cleaning features.
+    Comprehensive one-click Auto-Clean execution.
+    Cleans text even if previously downcast to category, removes duplicates,
+    imputes missing values, and caps extreme outliers.
     """
     audit = logger if logger is not None else AuditLogger()
     cleaned = df.copy()
@@ -391,12 +397,16 @@ def run_automated_cleaning(
     # 2. Purge exact duplicates
     cleaned = remove_duplicates(cleaned, logger=audit)
 
-    # 3. Trim whitespace from text columns
-    text_cols = [c for c in cleaned.columns if cleaned[c].dtype == "object" or isinstance(cleaned[c].dtype, pd.StringDtype)]
-    if text_cols:
-        cleaned = clean_text_columns(cleaned, columns=text_cols, strip_whitespace=True, logger=audit)
+    # 3. Clean text & string columns (including category dtypes)
+    text_and_cat_cols = [
+        c for c in cleaned.columns
+        if cleaned[c].dtype == "object"
+        or isinstance(cleaned[c].dtype, (pd.StringDtype, pd.CategoricalDtype))
+    ]
+    if text_and_cat_cols:
+        cleaned = clean_text_columns(cleaned, columns=text_and_cat_cols, strip_whitespace=True, logger=audit)
 
-    # 4. Impute missing values (median for numeric, mode for categorical)
+    # 4. Impute missing values (median for numeric, mode for categorical/text)
     for col in cleaned.columns:
         if cleaned[col].isna().sum() > 0:
             if pd.api.types.is_numeric_dtype(cleaned[col]):
@@ -404,14 +414,12 @@ def run_automated_cleaning(
             else:
                 cleaned = impute_missing_values(cleaned, columns=[col], strategy="mode", logger=audit)
 
-    # 5. Outlier clipping on numeric columns (IQR 3.0 safe threshold)
+    # 5. Outlier clipping on numeric columns (safe IQR 3.0 threshold)
     num_cols = [c for c in cleaned.columns if pd.api.types.is_numeric_dtype(cleaned[c])]
     outlier_summary = {}
     for nc in num_cols:
         cleaned, info = treat_outliers(cleaned, column=nc, method="iqr", threshold=3.0, action="cap", logger=audit)
         outlier_summary[nc] = info["outliers_detected"]
-
-    free_memory()
 
     summary = {
         "final_rows": len(cleaned),

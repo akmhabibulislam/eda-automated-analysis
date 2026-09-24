@@ -15,7 +15,6 @@ from typing import Dict, Any, List, Optional, Union
 import pandas as pd
 import numpy as np
 
-from backend.ingestion.memory import free_memory
 from backend.cleaning.cleaning import AuditLogger
 
 
@@ -27,19 +26,58 @@ def add_custom_formula_column(
 ) -> pd.DataFrame:
     """
     Feature 20: Custom Formula / Equation Builder.
-    Evaluates vector formulas such as `df['revenue'] - df['cost']` or expressions like `revenue * 1.15`.
+    Robustly evaluates expressions even when column names contain spaces, dashes, or special characters.
+    Supports standard syntax (e.g. `Revenue - Cost` or `df['Revenue'] - df['Cost']` or `np.log(Price)`).
     """
     result = df.copy()
-    
-    # Safe evaluation environment using pandas eval
+
+    # Create safe mapping replacing special characters in column names for evaluation
+    col_mapping = {}
+    reverse_mapping = {}
+    clean_expr = expression
+
+    # Sort columns by length descending so longer column names get replaced first
+    sorted_cols = sorted(list(result.columns), key=len, reverse=True)
+
+    local_dict = {
+        "np": np,
+        "pd": pd,
+        "df": result
+    }
+
+    # Map column references
+    for idx, col in enumerate(sorted_cols):
+        safe_alias = f"__col_{idx}__"
+        col_mapping[col] = safe_alias
+        reverse_mapping[safe_alias] = col
+        local_dict[safe_alias] = result[col]
+
+        # Support `column name` backtick notation or direct names with spaces
+        pattern_backtick = rf"`{re.escape(col)}`"
+        clean_expr = re.sub(pattern_backtick, safe_alias, clean_expr)
+
+        pattern_bracket = rf"df\[['\"]{re.escape(col)}['\"]\]"
+        clean_expr = re.sub(pattern_bracket, safe_alias, clean_expr)
+
+        # Match standalone column name with word boundaries
+        pattern_word = rf"(?<![\w'\"]){re.escape(col)}(?![\w'\"])"
+        clean_expr = re.sub(pattern_word, safe_alias, clean_expr)
+
+    # First attempt: pandas eval
     try:
-        result[new_column_name] = result.eval(expression)
+        result[new_column_name] = pd.eval(clean_expr, local_dict=local_dict, engine="python")
     except Exception:
-        # Fallback to local dict eval if columns have spaces or special characters
-        local_env = {col: result[col] for col in result.columns}
-        local_env["np"] = np
+        # Second attempt: Python eval with isolated builtins
         try:
-            result[new_column_name] = eval(expression, {"__builtins__": {}}, local_env)
+            safe_builtins = {
+                "abs": abs, "min": min, "max": max, "round": round,
+                "float": float, "int": int, "str": str, "bool": bool
+            }
+            res_series = eval(clean_expr, {"__builtins__": safe_builtins}, local_dict)
+            if isinstance(res_series, (pd.Series, np.ndarray, list, int, float)):
+                result[new_column_name] = res_series
+            else:
+                result[new_column_name] = pd.Series([res_series] * len(result))
         except Exception as e:
             raise ValueError(f"Failed to evaluate expression '{expression}': {str(e)}")
 
@@ -50,7 +88,6 @@ def add_custom_formula_column(
             rows_affected=len(result),
             columns_affected=[new_column_name]
         )
-    free_memory()
     return result
 
 
@@ -60,7 +97,7 @@ def bin_continuous_column(
     new_column_name: Optional[str] = None,
     bins: Union[int, List[float]] = 5,
     labels: Optional[List[str]] = None,
-    bin_type: str = "equal_width",  # equal_width or quantile
+    bin_type: str = "equal_width",
     logger: Optional[AuditLogger] = None
 ) -> pd.DataFrame:
     """
@@ -107,13 +144,10 @@ def aggregate_groupby(
             raise ValueError(f"Group column '{col}' not found.")
 
     grouped = df.groupby(group_columns).agg(aggregations)
-    # Flatten hierarchical columns if multiple aggregations were selected
     if isinstance(grouped.columns, pd.MultiIndex):
         grouped.columns = [f"{col}_{agg}" for col, agg in grouped.columns]
-    
-    result = grouped.reset_index()
-    free_memory()
-    return result
+
+    return grouped.reset_index()
 
 
 def merge_datasets(
@@ -146,7 +180,6 @@ def merge_datasets(
             rows_affected=len(result),
             columns_affected=list(result.columns)
         )
-    free_memory()
     return result
 
 
@@ -173,7 +206,6 @@ def extract_regex_patterns(
             lambda x: ", ".join(re.findall(pattern, x)) if pd.notna(x) else ""
         )
     else:
-        # If pattern has no capture group, enclose in parentheses
         compiled_pattern = pattern if "(" in pattern else f"({pattern})"
         extracted = str_series.str.extract(compiled_pattern, expand=False)
         result[new_column_name] = extracted
@@ -185,7 +217,6 @@ def extract_regex_patterns(
             rows_affected=int((result[new_column_name] != "").sum()),
             columns_affected=[new_column_name]
         )
-    free_memory()
     return result
 
 
@@ -206,11 +237,9 @@ def pivot_dataframe(
         aggfunc=aggfunc
     ).reset_index()
 
-    # Flatten column names if index is a multi-index
     if isinstance(pivoted.columns, pd.MultiIndex):
         pivoted.columns = [f"{col}_{lvl}".strip("_") for col, lvl in pivoted.columns]
 
-    free_memory()
     return pivoted
 
 
@@ -224,15 +253,13 @@ def unpivot_dataframe(
     """
     Feature 25b: Reshaping - Wide to Long (Unpivot / Melt).
     """
-    melted = pd.melt(
+    return pd.melt(
         df,
         id_vars=id_vars,
         value_vars=value_vars,
         var_name=var_name,
         value_name=value_name
     )
-    free_memory()
-    return melted
 
 
 def filter_rows(
@@ -242,7 +269,7 @@ def filter_rows(
 ) -> pd.DataFrame:
     """
     Feature 26: Custom Filtering & Querying.
-    Row filtering using custom query expression syntax (e.g. `age > 30 and status == 'active'`).
+    Row filtering using custom query expression syntax.
     """
     initial_rows = len(df)
     try:
@@ -258,5 +285,4 @@ def filter_rows(
             rows_affected=initial_rows - rows_retained,
             columns_affected=[]
         )
-    free_memory()
     return filtered_df

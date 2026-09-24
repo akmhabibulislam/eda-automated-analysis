@@ -1,11 +1,9 @@
 """
 Memory management and optimization layer for data processing pipelines.
-Provides automatic type downcasting, chunked loading support, RAM tracking,
-and explicit garbage collection.
+Provides automatic type downcasting, RAM tracking, and selective garbage collection.
 """
 
 import gc
-import sys
 import psutil
 from typing import Dict, Any, Tuple, Optional
 import pandas as pd
@@ -19,16 +17,16 @@ def get_memory_usage(df: pd.DataFrame) -> Dict[str, Any]:
     """
     if df is None or df.empty:
         return {"bytes": 0, "mb": 0.0, "readable": "0.00 MB"}
-    
+
     total_bytes = int(df.memory_usage(deep=True).sum())
     total_mb = total_bytes / (1024 * 1024)
     total_gb = total_mb / 1024
-    
+
     if total_gb >= 1.0:
         readable = f"{total_gb:.2f} GB"
     else:
         readable = f"{total_mb:.2f} MB"
-        
+
     return {
         "bytes": total_bytes,
         "mb": round(total_mb, 2),
@@ -66,22 +64,6 @@ def optimize_dataframe_memory(
     """
     Downcasts numeric types to the lowest safe representation and converts
     low-cardinality string/object columns to category dtype.
-
-    Parameters:
-    -----------
-    df : pd.DataFrame
-        Input dataframe to optimize
-    downcast_numeric : bool
-        Whether to downcast integer and float columns
-    convert_categories : bool
-        Whether to convert low-cardinality object columns to category
-    category_threshold : float
-        Ratio of unique values to total rows below which a column is categorical
-
-    Returns:
-    --------
-    Tuple[pd.DataFrame, Dict[str, Any]]
-        Optimized dataframe and performance impact metrics
     """
     if df is None or df.empty:
         return df, {"initial_mb": 0.0, "final_mb": 0.0, "reduction_percent": 0.0}
@@ -126,8 +108,6 @@ def optimize_dataframe_memory(
                 except Exception:
                     pass
 
-    free_memory()
-
     final_usage = get_memory_usage(optimized_df)
     final_mb = final_usage["mb"]
     saved_mb = max(0.0, initial_mb - final_mb)
@@ -143,8 +123,10 @@ def optimize_dataframe_memory(
     return optimized_df, metrics
 
 
-def free_memory():
+def free_memory(force: bool = False):
     """
-    Explicitly trigger Python garbage collector to free unreferenced memory blocks.
+    Explicitly trigger garbage collection only when requested or after heavy operations.
+    Avoids unnecessary CPU thrashing in tight loops.
     """
-    gc.collect()
+    if force:
+        gc.collect()

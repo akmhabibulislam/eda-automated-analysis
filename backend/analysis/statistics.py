@@ -5,7 +5,7 @@ Features 14-19:
 15. Categorical Frequency Distribution (value counts, percentages, unique value tallies)
 16. Missingness Matrix (visual heatmaps of missing data patterns)
 17. Correlation Matrix (Pearson, Spearman, and Kendall coefficients)
-18. Multi-Collinearity Detection (automated warnings for correlated predictor variables / VIF)
+18. Multi-Collinearity Detection (automated warnings for correlated predictor variables)
 19. Skewness & Kurtosis Analysis (symmetry and tail heaviness measurements)
 """
 
@@ -56,9 +56,9 @@ def compute_univariate_summary(df: pd.DataFrame) -> pd.DataFrame:
 def compute_categorical_distribution(df: pd.DataFrame, max_categories: int = 20) -> Dict[str, pd.DataFrame]:
     """
     Feature 15: Categorical Frequency Distribution.
-    Value counts, percentages, unique value tallies.
+    Detects categorical, string, and object columns cleanly without pandas select_dtypes deprecations.
     """
-    cat_cols = df.select_dtypes(include=["object", "category", "bool"]).columns
+    cat_cols = [c for c in df.columns if isinstance(df[c].dtype, (pd.CategoricalDtype, pd.StringDtype)) or df[c].dtype == "object" or pd.api.types.is_bool_dtype(df[c])]
     distributions = {}
 
     for col in cat_cols:
@@ -89,7 +89,6 @@ def compute_missingness_matrix(df: pd.DataFrame) -> Dict[str, Any]:
         "Missing_Percentage": missing_pcts.values
     }).sort_values(by="Missing_Count", ascending=False)
 
-    # Boolean matrix sampled if rows > 1000 for visualization performance
     if len(df) > 1000:
         sample_df = df.sample(n=1000, random_state=42)
     else:
@@ -162,9 +161,8 @@ def compute_skewness_kurtosis(df: pd.DataFrame) -> pd.DataFrame:
             continue
 
         skew_val = float(stats.skew(s, bias=False))
-        kurt_val = float(stats.kurtosis(s, bias=False))  # Fisher kurtosis (normal == 0)
+        kurt_val = float(stats.kurtosis(s, bias=False))
 
-        # Interpretation
         if abs(skew_val) < 0.5:
             skew_desc = "Fairly Symmetrical"
         elif skew_val > 0.5:

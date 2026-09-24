@@ -3,14 +3,14 @@ Exporting & Reporting module.
 Features 48-52:
 48. Cleaned Dataset Export (CSV, Excel, Parquet download bytes)
 49. Chart Image Export (PNG, SVG, HTML saving)
-50. Automated AI Executive Summary (plain-English narrative of key statistical findings)
+50. Automated Executive Summary (plain-English narrative of key statistical findings)
 51. Comprehensive HTML Report Generation
-52. PDF Report Export
+52. Dynamic Multi-Page PDF Report Export with Auto-Wrapping Tables
 """
 
 import io
 import datetime
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
@@ -18,8 +18,6 @@ from reportlab.lib.pagesizes import letter
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
-
-from backend.ingestion.memory import free_memory
 
 
 # -------------------------------------------------------------
@@ -53,7 +51,6 @@ def export_dataset_bytes(df: pd.DataFrame, file_format: str = "csv") -> Tuple[by
 
     buffer.seek(0)
     data = buffer.getvalue()
-    free_memory()
     return data, mime, ext
 
 
@@ -79,7 +76,7 @@ def generate_executive_summary(df: pd.DataFrame, audit_logs: Optional[List[Dict[
     """
     n_rows, n_cols = df.shape
     num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-    cat_cols = df.select_dtypes(include=["object", "category"]).columns.tolist()
+    cat_cols = [c for c in df.columns if isinstance(df[c].dtype, (pd.CategoricalDtype, pd.StringDtype)) or df[c].dtype == "object"]
     missing_cells = int(df.isna().sum().sum())
     total_cells = n_rows * n_cols
     missing_pct = round((missing_cells / total_cells * 100) if total_cells > 0 else 0.0, 2)
@@ -157,14 +154,10 @@ def generate_html_report(
     n_rows, n_cols = df.shape
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    # Sample table HTML
     preview_table_html = df.head(10).to_html(classes="styled-table", index=False)
-
-    # Numeric summary table HTML
     num_df = df.describe().round(2).reset_index()
     num_table_html = num_df.to_html(classes="styled-table", index=False) if not num_df.empty else "<p>No numeric columns.</p>"
 
-    # Chart embeds
     charts_html = ""
     if figures:
         for idx, fig in enumerate(figures):
@@ -175,7 +168,6 @@ def generate_html_report(
             </div>
             """
 
-    # Audit trail table
     audit_table_html = ""
     if audit_logs:
         audit_df = pd.DataFrame(audit_logs)
@@ -184,7 +176,7 @@ def generate_html_report(
         {audit_df.to_html(classes="styled-table", index=False)}
         """
 
-    html_content = f"""<!DOCTYPE html>
+    return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -223,11 +215,6 @@ def generate_html_report(
             font-size: 20px;
             margin-top: 32px;
             margin-bottom: 12px;
-        }}
-        h3 {{
-            color: #374151;
-            font-size: 16px;
-            margin-top: 16px;
         }}
         .executive-summary {{
             background: #f3f4f6;
@@ -291,11 +278,10 @@ def generate_html_report(
 </body>
 </html>
 """
-    return html_content
 
 
 # -------------------------------------------------------------
-# Feature 52: PDF Report Export
+# Feature 52: Multi-Page PDF Report with Dynamic Flowable Tables
 # -------------------------------------------------------------
 
 def generate_pdf_report(
@@ -304,50 +290,69 @@ def generate_pdf_report(
     audit_logs: Optional[List[Dict[str, Any]]] = None
 ) -> bytes:
     """
-    Builds an executive PDF report using ReportLab with clean corporate layout.
+    Builds an executive PDF report using ReportLab.
+    Dynamically computes printable page width and wraps every table cell in a
+    Paragraph flowable to prevent clipping or page overflow.
     """
     buffer = io.BytesIO()
+    margin = 36
     doc = SimpleDocTemplate(
         buffer,
         pagesize=letter,
-        rightMargin=40,
-        leftMargin=40,
-        topMargin=40,
-        bottomMargin=40
+        rightMargin=margin,
+        leftMargin=margin,
+        topMargin=margin,
+        bottomMargin=margin
     )
+    printable_width = letter[0] - (2 * margin)  # 540 pt
 
     styles = getSampleStyleSheet()
     title_style = ParagraphStyle(
         name="ReportTitle",
         parent=styles["Heading1"],
-        fontSize=22,
-        leading=26,
+        fontSize=20,
+        leading=24,
         textColor=colors.HexColor("#111827"),
-        spaceAfter=10
+        spaceAfter=8
     )
     meta_style = ParagraphStyle(
         name="MetaText",
         parent=styles["Normal"],
-        fontSize=10,
+        fontSize=9,
         textColor=colors.HexColor("#6b7280"),
-        spaceAfter=15
+        spaceAfter=14
     )
     h2_style = ParagraphStyle(
         name="Heading2Custom",
         parent=styles["Heading2"],
-        fontSize=14,
-        leading=18,
+        fontSize=13,
+        leading=16,
         textColor=colors.HexColor("#1f2937"),
-        spaceBefore=12,
-        spaceAfter=8
+        spaceBefore=10,
+        spaceAfter=6
     )
     body_style = ParagraphStyle(
         name="BodyCustom",
         parent=styles["Normal"],
-        fontSize=10,
-        leading=14,
+        fontSize=9,
+        leading=13,
         textColor=colors.HexColor("#374151"),
-        spaceAfter=10
+        spaceAfter=8
+    )
+    cell_style = ParagraphStyle(
+        name="TableCell",
+        parent=styles["Normal"],
+        fontSize=8,
+        leading=10,
+        textColor=colors.HexColor("#1f2937")
+    )
+    header_cell_style = ParagraphStyle(
+        name="TableHeaderCell",
+        parent=styles["Normal"],
+        fontSize=8,
+        leading=10,
+        fontName="Helvetica-Bold",
+        textColor=colors.HexColor("#111827")
     )
 
     elements = []
@@ -356,7 +361,7 @@ def generate_pdf_report(
     elements.append(Paragraph("Executive Data Analysis Report", title_style))
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     elements.append(Paragraph(f"Generated: {timestamp} | Total Rows: {len(df):,} | Total Columns: {len(df.columns)}", meta_style))
-    elements.append(Spacer(1, 10))
+    elements.append(Spacer(1, 8))
 
     # Executive Narrative
     elements.append(Paragraph("Executive Narrative", h2_style))
@@ -364,54 +369,70 @@ def generate_pdf_report(
         clean_para = paragraph.replace("**", "")
         elements.append(Paragraph(clean_para, body_style))
 
-    elements.append(Spacer(1, 15))
+    elements.append(Spacer(1, 10))
 
-    # Dataset Statistics Table
-    elements.append(Paragraph("Key Descriptive Statistics", h2_style))
+    # Descriptive Statistics Table with auto-wrapped cells
+    elements.append(Paragraph("Descriptive Statistics", h2_style))
     num_df = df.describe().round(2).reset_index()
 
     if not num_df.empty:
-        # Take first 5 columns to fit printable page width
-        sub_df = num_df.iloc[:, :min(6, len(num_df.columns))]
-        table_data = [list(sub_df.columns)] + sub_df.astype(str).values.tolist()
+        # Limit to first 6 metrics to ensure readable column spacing
+        selected_cols = list(num_df.columns[:min(6, len(num_df.columns))])
+        col_width = printable_width / len(selected_cols)
 
-        t = Table(table_data, colWidths=85)
+        table_flowables = []
+        # Header row
+        header_row = [Paragraph(str(c), header_cell_style) for c in selected_cols]
+        table_flowables.append(header_row)
+
+        # Value rows
+        for _, row in num_df[selected_cols].iterrows():
+            row_cells = [Paragraph(str(val), cell_style) for val in row]
+            table_flowables.append(row_cells)
+
+        t = Table(table_flowables, colWidths=[col_width] * len(selected_cols))
         t.setStyle(TableStyle([
             ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#f3f4f6")),
-            ('TEXTCOLOR', (0, 0), (-1, 0), colors.HexColor("#111827")),
-            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-            ('FONTSIZE', (0, 0), (-1, -1), 8),
-            ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
-            ('TOPPADDING', (0, 0), (-1, -1), 5),
+            ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+            ('TOPPADDING', (0, 0), (-1, -1), 4),
+            ('LEFTPADDING', (0, 0), (-1, -1), 4),
+            ('RIGHTPADDING', (0, 0), (-1, -1), 4),
             ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor("#e5e7eb")),
         ]))
         elements.append(t)
 
-    # Audit Trail Table
+    # Lineage Audit Trail Table with auto-wrapped cells
     if audit_logs:
-        elements.append(Spacer(1, 15))
-        elements.append(Paragraph("Transformation Lineage Log", h2_style))
-        audit_data = [["Timestamp", "Action", "Details", "Rows Affected"]]
-        for log in audit_logs[-10:]:
-            audit_data.append([
-                str(log.get("timestamp", ""))[-8:],
-                str(log.get("action", ""))[:22],
-                str(log.get("details", ""))[:35],
-                str(log.get("rows_affected", 0))
+        elements.append(Spacer(1, 12))
+        elements.append(Paragraph("Data Lineage and Transformation History", h2_style))
+
+        audit_headers = ["Timestamp", "Action", "Details", "Rows Affected"]
+        col_widths = [printable_width * 0.18, printable_width * 0.25, printable_width * 0.42, printable_width * 0.15]
+
+        audit_flowables = [[Paragraph(h, header_cell_style) for h in audit_headers]]
+        for log in audit_logs[-12:]:
+            audit_flowables.append([
+                Paragraph(str(log.get("timestamp", ""))[-8:], cell_style),
+                Paragraph(str(log.get("action", "")), cell_style),
+                Paragraph(str(log.get("details", "")), cell_style),
+                Paragraph(str(log.get("rows_affected", 0)), cell_style)
             ])
-        t_audit = Table(audit_data, colWidths=[65, 120, 240, 75])
+
+        t_audit = Table(audit_flowables, colWidths=col_widths)
         t_audit.setStyle(TableStyle([
             ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#f3f4f6")),
-            ('TEXTCOLOR', (0, 0), (-1, 0), colors.HexColor("#111827")),
-            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-            ('FONTSIZE', (0, 0), (-1, -1), 8),
+            ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+            ('TOPPADDING', (0, 0), (-1, -1), 4),
+            ('LEFTPADDING', (0, 0), (-1, -1), 4),
+            ('RIGHTPADDING', (0, 0), (-1, -1), 4),
             ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor("#e5e7eb")),
         ]))
         elements.append(t_audit)
 
     doc.build(elements)
     buffer.seek(0)
-    pdf_bytes = buffer.getvalue()
-    free_memory()
-    return pdf_bytes
+    return buffer.getvalue()
