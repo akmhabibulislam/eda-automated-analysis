@@ -6,8 +6,8 @@ Features 6-13:
 8. Duplicate Removal (exact and partial duplicate purging)
 9. Outlier Detection & Treatment (Z-score and IQR-based anomaly flagging with capping/clipping/dropping)
 10. Column Header Standardization (automatic whitespace removal and case formatting)
-11. Text & String Cleaning (whitespace trimming, capitalization fixes, special character stripping)
-12. Data Type Casting (manual and automatic conversion of column types)
+11. Text & String Cleaning (preserving nulls, whitespace trimming, casing, special character stripping)
+12. Data Type Casting (manual and automatic conversion with robust boolean parsing)
 13. Data Lineage / Audit Trail (chronological logging of all applied cleaning steps)
 """
 
@@ -230,6 +230,9 @@ def treat_outliers(
     result = df.copy()
     series = result[column].dropna()
 
+    if len(series) == 0:
+        return result, {"method": method, "action": action, "outliers_detected": 0}
+
     if method == "iqr":
         q25 = series.quantile(0.25)
         q75 = series.quantile(0.75)
@@ -295,8 +298,8 @@ def clean_text_columns(
     logger: Optional[AuditLogger] = None
 ) -> pd.DataFrame:
     """
-    Feature 11: Text & String Cleaning (whitespace trimming, capitalization fixes, special character stripping).
-    Safely handles both object/string dtypes and category dtypes without crashing or skipping.
+    Feature 11: Text & String Cleaning with strict null preservation.
+    Never converts NaN to string 'nan' or 'None'.
     """
     result = df.copy()
 
@@ -305,35 +308,64 @@ def clean_text_columns(
             continue
 
         was_category = isinstance(result[col].dtype, pd.CategoricalDtype)
-        # Convert to string series for clean vectorized manipulations
-        s = result[col].astype(str)
+        series = result[col].copy()
 
-        if strip_whitespace:
-            s = s.str.strip()
+        def clean_val(val):
+            if pd.isna(val):
+                return np.nan
+            v = str(val)
+            if strip_whitespace:
+                v = v.strip()
+            if case_transformation == "lower":
+                v = v.lower()
+            elif case_transformation == "upper":
+                v = v.upper()
+            elif case_transformation == "title":
+                v = v.title()
+            if remove_special_chars:
+                v = re.sub(r"[^\w\s]", "", v)
+            return v
 
-        if case_transformation == "lower":
-            s = s.str.lower()
-        elif case_transformation == "upper":
-            s = s.str.upper()
-        elif case_transformation == "title":
-            s = s.str.title()
-
-        if remove_special_chars:
-            s = s.apply(lambda x: re.sub(r"[^\w\s]", "", str(x)) if pd.notna(x) else x)
+        cleaned_series = series.apply(clean_val)
 
         if was_category:
-            result[col] = s.astype("category")
+            result[col] = cleaned_series.astype("category")
         else:
-            result[col] = s
+            result[col] = cleaned_series
 
     if logger:
         logger.log(
             action="Text & String Cleaning",
-            details=f"Cleaned string formatting for {columns}",
+            details=f"Cleaned string formatting for {columns} (preserved nulls)",
             rows_affected=len(result),
             columns_affected=columns
         )
     return result
+
+
+BOOLEAN_TRUE_VALUES = {"true", "yes", "y", "1", "1.0", "t"}
+BOOLEAN_FALSE_VALUES = {"false", "no", "n", "0", "0.0", "f"}
+
+
+def parse_boolean_series(series: pd.Series) -> pd.Series:
+    """
+    Explicit boolean parser.
+    Eliminates astype(bool) bugs where non-empty string 'False' turns into True.
+    """
+    def to_bool(val):
+        if pd.isna(val):
+            return pd.NA
+        if isinstance(val, (bool, np.bool_)):
+            return bool(val)
+        v_str = str(val).strip().lower()
+        if v_str in BOOLEAN_TRUE_VALUES:
+            return True
+        elif v_str in BOOLEAN_FALSE_VALUES:
+            return False
+        else:
+            raise ValueError(f"Cannot parse ambiguous value '{val}' as boolean.")
+
+    return series.apply(to_bool).astype("boolean")
 
 
 def cast_data_types(
@@ -342,8 +374,7 @@ def cast_data_types(
     logger: Optional[AuditLogger] = None
 ) -> pd.DataFrame:
     """
-    Feature 12: Data Type Casting (manual and automatic conversion of column types).
-    Valid targets: 'int', 'float', 'string', 'datetime', 'boolean', 'category'.
+    Feature 12: Data Type Casting with robust boolean parsing.
     """
     result = df.copy()
     succeeded_cols = []
@@ -358,11 +389,11 @@ def cast_data_types(
             elif target in ["float", "float64"]:
                 result[col] = pd.to_numeric(result[col], errors="coerce").astype(float)
             elif target in ["str", "string"]:
-                result[col] = result[col].astype(str)
+                result[col] = result[col].astype("string")
             elif target in ["datetime", "date"]:
                 result[col] = pd.to_datetime(result[col], errors="coerce")
             elif target in ["bool", "boolean"]:
-                result[col] = result[col].astype(bool)
+                result[col] = parse_boolean_series(result[col])
             elif target in ["category", "categorical"]:
                 result[col] = result[col].astype("category")
             succeeded_cols.append(col)
@@ -379,52 +410,100 @@ def cast_data_types(
     return result
 
 
+def analyze_cleaning_recommendations(df: pd.DataFrame) -> Dict[str, Any]:
+    """
+    Generates actionable, non-destructive cleaning recommendations for user inspection.
+    Prevents blind mutations.
+    """
+    recs = {
+        "header_standardization_needed": any(not c.isidentifier() for c in df.columns),
+        "duplicate_rows": int(df.duplicated().sum()),
+        "missing_columns": {},
+        "outlier_candidates": {}
+    }
+
+    for col in df.columns:
+        n_missing = int(df[col].isna().sum())
+        if n_missing > 0:
+            recs["missing_columns"][col] = {
+                "count": n_missing,
+                "pct": round(n_missing / len(df) * 100, 2),
+                "suggested_imputation": "median" if pd.api.types.is_numeric_dtype(df[col]) else "mode"
+            }
+
+        if pd.api.types.is_numeric_dtype(df[col]):
+            s = df[col].dropna()
+            if len(s) > 10:
+                q25, q75 = s.quantile(0.25), s.quantile(0.75)
+                iqr = q75 - q25
+                outliers = int(((s < q25 - 3.0 * iqr) | (s > q75 + 3.0 * iqr)).sum())
+                if outliers > 0:
+                    recs["outlier_candidates"][col] = {
+                        "count": outliers,
+                        "pct": round(outliers / len(s) * 100, 2)
+                    }
+
+    return recs
+
+
 def run_automated_cleaning(
     df: pd.DataFrame,
-    logger: Optional[AuditLogger] = None
+    logger: Optional[AuditLogger] = None,
+    impute_missing: bool = False,
+    cap_outliers: bool = False,
+    standardize_headers: bool = True,
+    purge_duplicates: bool = True,
+    clean_strings: bool = True
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     """
-    Comprehensive one-click Auto-Clean execution.
-    Cleans text even if previously downcast to category, removes duplicates,
-    imputes missing values, and caps extreme outliers.
+    Explicit, controlled cleaning pipeline.
+    By default, performs safe non-mutating cleanup (headers, exact duplicates, text whitespace)
+    and DOES NOT blindly impute values or cap outliers unless explicitly configured by the user.
     """
     audit = logger if logger is not None else AuditLogger()
     cleaned = df.copy()
 
     # 1. Standardize headers
-    cleaned = standardize_column_headers(cleaned, case_style="snake_case", logger=audit)
+    if standardize_headers:
+        cleaned = standardize_column_headers(cleaned, case_style="snake_case", logger=audit)
 
     # 2. Purge exact duplicates
-    cleaned = remove_duplicates(cleaned, logger=audit)
+    if purge_duplicates:
+        cleaned = remove_duplicates(cleaned, logger=audit)
 
-    # 3. Clean text & string columns (including category dtypes)
-    text_and_cat_cols = [
-        c for c in cleaned.columns
-        if cleaned[c].dtype == "object"
-        or isinstance(cleaned[c].dtype, (pd.StringDtype, pd.CategoricalDtype))
-    ]
-    if text_and_cat_cols:
-        cleaned = clean_text_columns(cleaned, columns=text_and_cat_cols, strip_whitespace=True, logger=audit)
+    # 3. Clean text columns without stringifying NaNs
+    if clean_strings:
+        text_cols = [
+            c for c in cleaned.columns
+            if cleaned[c].dtype == "object"
+            or isinstance(cleaned[c].dtype, (pd.StringDtype, pd.CategoricalDtype))
+        ]
+        if text_cols:
+            cleaned = clean_text_columns(cleaned, columns=text_cols, strip_whitespace=True, logger=audit)
 
-    # 4. Impute missing values (median for numeric, mode for categorical/text)
-    for col in cleaned.columns:
-        if cleaned[col].isna().sum() > 0:
-            if pd.api.types.is_numeric_dtype(cleaned[col]):
-                cleaned = impute_missing_values(cleaned, columns=[col], strategy="median", logger=audit)
-            else:
-                cleaned = impute_missing_values(cleaned, columns=[col], strategy="mode", logger=audit)
+    # 4. Optional missing value imputation (opt-in)
+    if impute_missing:
+        for col in cleaned.columns:
+            if cleaned[col].isna().sum() > 0:
+                if pd.api.types.is_numeric_dtype(cleaned[col]):
+                    cleaned = impute_missing_values(cleaned, columns=[col], strategy="median", logger=audit)
+                else:
+                    cleaned = impute_missing_values(cleaned, columns=[col], strategy="mode", logger=audit)
 
-    # 5. Outlier clipping on numeric columns (safe IQR 3.0 threshold)
-    num_cols = [c for c in cleaned.columns if pd.api.types.is_numeric_dtype(cleaned[c])]
+    # 5. Optional outlier treatment (opt-in)
     outlier_summary = {}
-    for nc in num_cols:
-        cleaned, info = treat_outliers(cleaned, column=nc, method="iqr", threshold=3.0, action="cap", logger=audit)
-        outlier_summary[nc] = info["outliers_detected"]
+    if cap_outliers:
+        num_cols = [c for c in cleaned.columns if pd.api.types.is_numeric_dtype(cleaned[c])]
+        for nc in num_cols:
+            cleaned, info = treat_outliers(cleaned, column=nc, method="iqr", threshold=3.0, action="cap", logger=audit)
+            outlier_summary[nc] = info["outliers_detected"]
 
     summary = {
         "final_rows": len(cleaned),
         "final_columns": len(cleaned.columns),
         "steps_executed": len(audit.get_logs()),
+        "imputation_performed": impute_missing,
+        "outlier_capping_performed": cap_outliers,
         "outlier_caps": outlier_summary
     }
 

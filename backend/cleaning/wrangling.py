@@ -1,21 +1,103 @@
 """
 Advanced Data Wrangling & Transformations module.
 Features 20-26:
-20. Custom Formula / Equation Builder (creating calculated columns via mathematical expressions like `Revenue - Cost`)
+20. Secure Formula / Calculated Column Builder (AST-restricted parser)
 21. Binning & Discretization (grouping continuous numerical data into discrete ranges)
 22. SQL-like Groupby & Aggregations (grouping by categories and applying summary functions)
 23. Merging & Joining (combining datasets using inner, left, right, or outer joins)
 24. Text Regex Extraction (pulling patterns like emails, phone numbers, zip codes)
 25. Data Pivoting & Unpivoting (reshaping between wide and long formats)
-26. Custom Filtering & Querying (row filtering using custom expression builders)
+26. Structured Query Filtering (secure non-eval row selection)
 """
 
+import ast
 import re
 from typing import Dict, Any, List, Optional, Union
 import pandas as pd
 import numpy as np
 
 from backend.cleaning.cleaning import AuditLogger
+
+
+# Restricted mathematical functions allowed in secure AST evaluation
+ALLOWED_FUNCTIONS = {
+    "abs": np.abs,
+    "sqrt": np.sqrt,
+    "log": np.log,
+    "exp": np.exp,
+    "round": np.round,
+    "sin": np.sin,
+    "cos": np.cos,
+    "tan": np.tan
+}
+
+
+class SecureExpressionEvaluator(ast.NodeVisitor):
+    """
+    AST-based expression validator and evaluator.
+    Strictly forbids dangerous Python operations (__import__, open, eval, exec, lambda, etc.)
+    and only permits safe arithmetic, unary operations, math calls, and dataset column lookups.
+    """
+    def __init__(self, df: pd.DataFrame):
+        self.df = df
+
+    def evaluate(self, node: ast.AST) -> Any:
+        if isinstance(node, ast.Expression):
+            return self.evaluate(node.body)
+
+        elif isinstance(node, ast.Constant):
+            return node.value
+
+        elif isinstance(node, ast.Name):
+            col_name = node.id
+            if col_name in self.df.columns:
+                return self.df[col_name]
+            elif col_name in ALLOWED_FUNCTIONS:
+                return ALLOWED_FUNCTIONS[col_name]
+            else:
+                raise ValueError(f"Unknown variable or column '{col_name}' in expression.")
+
+        elif isinstance(node, ast.UnaryOp):
+            operand = self.evaluate(node.operand)
+            if isinstance(node.op, ast.UAdd):
+                return +operand
+            elif isinstance(node.op, ast.USub):
+                return -operand
+            else:
+                raise ValueError(f"Unsupported unary operator: {type(node.op).__name__}")
+
+        elif isinstance(node, ast.BinOp):
+            left = self.evaluate(node.left)
+            right = self.evaluate(node.right)
+            if isinstance(node.op, ast.Add):
+                return left + right
+            elif isinstance(node.op, ast.Sub):
+                return left - right
+            elif isinstance(node.op, ast.Mult):
+                return left * right
+            elif isinstance(node.op, ast.Div):
+                return left / right
+            elif isinstance(node.op, ast.FloorDiv):
+                return left // right
+            elif isinstance(node.op, ast.Mod):
+                return left % right
+            elif isinstance(node.op, ast.Pow):
+                return left ** right
+            else:
+                raise ValueError(f"Unsupported binary operator: {type(node.op).__name__}")
+
+        elif isinstance(node, ast.Call):
+            if not isinstance(node.func, ast.Name):
+                raise ValueError("Dangerous dynamic function call blocked.")
+            func_name = node.func.id
+            if func_name not in ALLOWED_FUNCTIONS:
+                raise ValueError(f"Function '{func_name}' is not in the allowed math function library.")
+
+            args = [self.evaluate(arg) for arg in node.args]
+            return ALLOWED_FUNCTIONS[func_name](*args)
+
+        else:
+            raise ValueError(f"Security Violation: AST node type '{type(node).__name__}' is strictly prohibited.")
 
 
 def add_custom_formula_column(
@@ -25,65 +107,46 @@ def add_custom_formula_column(
     logger: Optional[AuditLogger] = None
 ) -> pd.DataFrame:
     """
-    Feature 20: Custom Formula / Equation Builder.
-    Robustly evaluates expressions even when column names contain spaces, dashes, or special characters.
-    Supports standard syntax (e.g. `Revenue - Cost` or `df['Revenue'] - df['Cost']` or `np.log(Price)`).
+    Feature 20: Secure AST-based Formula Builder.
+    Evaluates arithmetic and math expressions safely without arbitrary code execution risk.
+    Supports column aliases with spaces and backticks.
     """
     result = df.copy()
 
-    # Create safe mapping replacing special characters in column names for evaluation
-    col_mapping = {}
-    reverse_mapping = {}
+    # Pre-process expression to map column names with spaces into valid AST identifiers
     clean_expr = expression
+    alias_map = {}
+    reverse_map = {}
 
-    # Sort columns by length descending so longer column names get replaced first
     sorted_cols = sorted(list(result.columns), key=len, reverse=True)
+    temp_df = result.copy()
 
-    local_dict = {
-        "np": np,
-        "pd": pd,
-        "df": result
-    }
-
-    # Map column references
     for idx, col in enumerate(sorted_cols):
-        safe_alias = f"__col_{idx}__"
-        col_mapping[col] = safe_alias
-        reverse_mapping[safe_alias] = col
-        local_dict[safe_alias] = result[col]
+        alias = f"col_alias_{idx}"
+        alias_map[col] = alias
+        reverse_map[alias] = col
+        temp_df[alias] = temp_df[col]
 
-        # Support `column name` backtick notation or direct names with spaces
         pattern_backtick = rf"`{re.escape(col)}`"
-        clean_expr = re.sub(pattern_backtick, safe_alias, clean_expr)
+        clean_expr = re.sub(pattern_backtick, alias, clean_expr)
 
         pattern_bracket = rf"df\[['\"]{re.escape(col)}['\"]\]"
-        clean_expr = re.sub(pattern_bracket, safe_alias, clean_expr)
+        clean_expr = re.sub(pattern_bracket, alias, clean_expr)
 
-        # Match standalone column name with word boundaries
         pattern_word = rf"(?<![\w'\"]){re.escape(col)}(?![\w'\"])"
-        clean_expr = re.sub(pattern_word, safe_alias, clean_expr)
+        clean_expr = re.sub(pattern_word, alias, clean_expr)
 
-    # First attempt: pandas eval
     try:
-        result[new_column_name] = pd.eval(clean_expr, local_dict=local_dict, engine="python")
-    except Exception:
-        # Second attempt: Python eval with isolated builtins
-        try:
-            safe_builtins = {
-                "abs": abs, "min": min, "max": max, "round": round,
-                "float": float, "int": int, "str": str, "bool": bool
-            }
-            res_series = eval(clean_expr, {"__builtins__": safe_builtins}, local_dict)
-            if isinstance(res_series, (pd.Series, np.ndarray, list, int, float)):
-                result[new_column_name] = res_series
-            else:
-                result[new_column_name] = pd.Series([res_series] * len(result))
-        except Exception as e:
-            raise ValueError(f"Failed to evaluate expression '{expression}': {str(e)}")
+        parsed_ast = ast.parse(clean_expr, mode="eval")
+        evaluator = SecureExpressionEvaluator(temp_df)
+        computed = evaluator.evaluate(parsed_ast)
+        result[new_column_name] = computed
+    except Exception as e:
+        raise ValueError(f"Formula evaluation rejected: {str(e)}")
 
     if logger:
         logger.log(
-            action="Custom Formula Column",
+            action="Custom Formula Column (Secure AST)",
             details=f"Created '{new_column_name}' with expression: {expression}",
             rows_affected=len(result),
             columns_affected=[new_column_name]
@@ -102,7 +165,6 @@ def bin_continuous_column(
 ) -> pd.DataFrame:
     """
     Feature 21: Binning & Discretization.
-    Groups continuous numerical data into discrete ranges using equal-width or quantile binning.
     """
     if column not in df.columns or not pd.api.types.is_numeric_dtype(df[column]):
         raise ValueError(f"Column '{column}' is not a valid numeric column.")
@@ -137,13 +199,12 @@ def aggregate_groupby(
 ) -> pd.DataFrame:
     """
     Feature 22: SQL-like Groupby & Aggregations.
-    Groups by one or more categories and applies aggregate functions (mean, sum, count, std, min, max, median).
     """
     for col in group_columns:
         if col not in df.columns:
             raise ValueError(f"Group column '{col}' not found.")
 
-    grouped = df.groupby(group_columns).agg(aggregations)
+    grouped = df.groupby(group_columns, observed=False).agg(aggregations)
     if isinstance(grouped.columns, pd.MultiIndex):
         grouped.columns = [f"{col}_{agg}" for col, agg in grouped.columns]
 
@@ -161,7 +222,6 @@ def merge_datasets(
 ) -> pd.DataFrame:
     """
     Feature 23: Merging & Joining.
-    Combines datasets using inner, left, right, or outer joins.
     """
     result = pd.merge(
         left=left_df,
@@ -193,7 +253,6 @@ def extract_regex_patterns(
 ) -> pd.DataFrame:
     """
     Feature 24: Text Regex Extraction.
-    Extracts regex matches (e.g. emails, phone numbers, zip codes) into a new column.
     """
     if source_column not in df.columns:
         raise ValueError(f"Column '{source_column}' does not exist.")
@@ -234,7 +293,8 @@ def pivot_dataframe(
         index=index_cols,
         columns=columns,
         values=values,
-        aggfunc=aggfunc
+        aggfunc=aggfunc,
+        observed=False
     ).reset_index()
 
     if isinstance(pivoted.columns, pd.MultiIndex):
@@ -262,27 +322,54 @@ def unpivot_dataframe(
     )
 
 
-def filter_rows(
+SUPPORTED_QUERY_OPERATORS = ["==", "!=", ">", ">=", "<", "<=", "contains", "in"]
+
+
+def filter_rows_structured(
     df: pd.DataFrame,
-    query_expression: str,
+    column: str,
+    operator: str,
+    comparison_value: Any,
     logger: Optional[AuditLogger] = None
 ) -> pd.DataFrame:
     """
-    Feature 26: Custom Filtering & Querying.
-    Row filtering using custom query expression syntax.
+    Feature 26: Secure, structured row filtering.
+    Replaces unrestricted eval/query strings with typed parametric comparisons.
     """
-    initial_rows = len(df)
-    try:
-        filtered_df = df.query(query_expression).reset_index(drop=True)
-    except Exception as e:
-        raise ValueError(f"Invalid query expression '{query_expression}': {str(e)}")
+    if column not in df.columns:
+        raise ValueError(f"Column '{column}' not found in dataframe.")
 
+    initial_rows = len(df)
+    s = df[column]
+
+    if operator == "==":
+        mask = s == comparison_value
+    elif operator == "!=":
+        mask = s != comparison_value
+    elif operator == ">":
+        mask = s > float(comparison_value)
+    elif operator == ">=":
+        mask = s >= float(comparison_value)
+    elif operator == "<":
+        mask = s < float(comparison_value)
+    elif operator == "<=":
+        mask = s <= float(comparison_value)
+    elif operator == "contains":
+        mask = s.astype(str).str.contains(str(comparison_value), case=False, na=False)
+    elif operator == "in":
+        val_list = [v.strip() for v in str(comparison_value).split(",")]
+        mask = s.astype(str).isin(val_list)
+    else:
+        raise ValueError(f"Unsupported query operator '{operator}'. Allowed: {SUPPORTED_QUERY_OPERATORS}")
+
+    filtered_df = df[mask].reset_index(drop=True)
     rows_retained = len(filtered_df)
+
     if logger:
         logger.log(
-            action="Filter Rows",
-            details=f"Applied query: '{query_expression}' (retained {rows_retained} of {initial_rows} rows)",
+            action="Filter Rows (Structured)",
+            details=f"{column} {operator} {comparison_value} (retained {rows_retained} of {initial_rows})",
             rows_affected=initial_rows - rows_retained,
-            columns_affected=[]
+            columns_affected=[column]
         )
     return filtered_df

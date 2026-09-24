@@ -2,8 +2,8 @@
 Data ingestion module supporting multi-format file uploads and database connections.
 Features 1-5:
 1. Multi-Format File Upload (CSV, Excel, JSON, Parquet, TSV) with true chunking / streaming options
-2. Database Connectors (SQLite, PostgreSQL, MySQL query support)
-3. Data Schema Detection (automatic identification with robust date validation)
+2. Database Connectors (SQLite, PostgreSQL, MySQL query support with timeouts & validation)
+3. Data Schema Detection (automatic identification with robust date and ID distinction)
 4. Dataset Overview Dashboard (total rows, columns, memory footprint, duplicate counts)
 5. Data Preview Table (interactive, filterable, and sortable data grid metadata)
 """
@@ -16,30 +16,40 @@ import pandas as pd
 import numpy as np
 from sqlalchemy import create_engine, text
 
-from backend.ingestion.memory import optimize_dataframe_memory, get_memory_usage, free_memory
+from backend.ingestion.memory import optimize_dataframe_memory, get_memory_usage
 
 
-LARGE_FILE_THRESHOLD_BYTES = 50 * 1024 * 1024
+SUPPORTED_FORMATS = {
+    ".csv": "csv",
+    ".tsv": "tsv",
+    ".tab": "tsv",
+    ".xlsx": "excel",
+    ".xls": "excel",
+    ".json": "json",
+    ".parquet": "parquet",
+    ".pq": "parquet",
+}
+
 DEFAULT_CHUNK_SIZE = 50000
 
 
 def detect_file_format(file_name: str) -> str:
     """
     Identifies file extension from file name.
+    Strictly raises ValueError on unsupported or ambiguous formats (e.g., .xyz, .txt).
     """
     ext = os.path.splitext(file_name)[1].lower()
-    mapping = {
-        ".csv": "csv",
-        ".tsv": "tsv",
-        ".tab": "tsv",
-        ".txt": "csv",
-        ".xlsx": "excel",
-        ".xls": "excel",
-        ".json": "json",
-        ".parquet": "parquet",
-        ".pq": "parquet",
-    }
-    return mapping.get(ext, "csv")
+    if ext == ".txt":
+        raise ValueError(
+            f"Ambiguous file extension '{ext}' for file '{file_name}'. "
+            "Please rename to .csv or .tsv to indicate delimiter explicitly."
+        )
+    if ext not in SUPPORTED_FORMATS:
+        raise ValueError(
+            f"Unsupported file format '{ext}' for file '{file_name}'. "
+            f"Supported extensions: {', '.join(sorted(SUPPORTED_FORMATS.keys()))}"
+        )
+    return SUPPORTED_FORMATS[ext]
 
 
 def stream_dataset_chunks(
@@ -49,8 +59,7 @@ def stream_dataset_chunks(
     auto_optimize: bool = True
 ) -> Generator[pd.DataFrame, None, None]:
     """
-    Streams file in chunks to prevent memory blowup on large datasets.
-    Each yielded chunk is independently memory-downcasted.
+    Streams flat files in chunks to prevent memory blowup on large datasets.
     """
     fmt = detect_file_format(file_name)
     sep = "\t" if fmt == "tsv" else ","
@@ -62,7 +71,6 @@ def stream_dataset_chunks(
                 chunk, _ = optimize_dataframe_memory(chunk)
             yield chunk
     else:
-        # For non-splittable formats, load single chunk
         df, _ = load_dataset(file_source, file_name, auto_optimize=auto_optimize)
         yield df
 
@@ -76,7 +84,6 @@ def load_dataset(
 ) -> Tuple[Union[pd.DataFrame, Generator[pd.DataFrame, None, None]], Dict[str, Any]]:
     """
     Universal dataset reader supporting CSV, Excel, JSON, Parquet, TSV with memory management.
-    If chunksize is specified without full load requirement, returns a generator instead of concatenating.
     """
     fmt = detect_file_format(file_name)
     metadata: Dict[str, Any] = {
@@ -88,7 +95,6 @@ def load_dataset(
     }
 
     try:
-        # If user explicitly requests chunked streaming without sampling
         if chunksize and fmt in ["csv", "tsv"] and sample_rows is None:
             metadata["is_streaming"] = True
             metadata["chunk_size"] = chunksize
@@ -128,9 +134,11 @@ def load_dataset(
                 metadata["was_sampled"] = True
 
         else:
-            df = pd.read_csv(file_source)
+            raise ValueError(f"Unhandled format: {fmt}")
 
     except Exception as e:
+        if isinstance(e, ValueError) and "Unsupported file format" in str(e):
+            raise
         raise ValueError(f"Failed to parse {file_name} as {fmt}: {str(e)}")
 
     if auto_optimize:
@@ -142,22 +150,51 @@ def load_dataset(
     return df, metadata
 
 
+DISALLOWED_SQL_KEYWORDS = ["DROP", "DELETE", "UPDATE", "INSERT", "ALTER", "TRUNCATE", "REPLACE", "CREATE", "GRANT"]
+
+
 def load_from_database(
     connection_string: str,
     query: str,
-    auto_optimize: bool = True
+    auto_optimize: bool = True,
+    timeout_seconds: int = 15,
+    max_rows: int = 500000
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     """
-    Connect to SQLite, PostgreSQL, MySQL or other SQL databases via SQLAlchemy and execute query.
+    Connect to SQL databases with read-only validation, execution timeouts, and row ceilings.
     """
-    engine = create_engine(connection_string)
+    clean_query = query.strip()
+    upper_query = clean_query.upper()
+
+    # Enforce read-only semantics
+    if not (upper_query.startswith("SELECT") or upper_query.startswith("WITH")):
+        raise ValueError("Security Violation: Only SELECT and WITH (CTE) queries are permitted.")
+
+    for kw in DISALLOWED_SQL_KEYWORDS:
+        pattern = rf"\b{kw}\b"
+        if re.search(pattern, upper_query):
+            raise ValueError(f"Security Violation: Prohibited query keyword '{kw}' detected.")
+
+    engine = create_engine(
+        connection_string,
+        connect_args={"timeout": timeout_seconds} if "sqlite" in connection_string else {}
+    )
+
     with engine.connect() as conn:
-        df = pd.read_sql(text(query), conn)
+        with conn.execution_options(timeout=timeout_seconds):
+            df = pd.read_sql(text(clean_query), conn)
+
+    if len(df) > max_rows:
+        df = df.iloc[:max_rows].copy()
+        was_capped = True
+    else:
+        was_capped = False
 
     metadata = {
         "source": "database",
         "query": query,
-        "rows_retrieved": len(df)
+        "rows_retrieved": len(df),
+        "was_capped": was_capped
     }
 
     if auto_optimize:
@@ -169,33 +206,40 @@ def load_from_database(
     return df, metadata
 
 
-# Strict date regex patterns to prevent UUIDs, SKUs, or random alphanumeric strings from false matching
 DATE_PATTERNS = [
-    r"^\d{4}[-/]\d{1,2}[-/]\d{1,2}",           # 2024-01-01, 2024/01/01
-    r"^\d{1,2}[-/]\d{1,2}[-/]\d{4}",           # 01-01-2024, 01/01/2024
-    r"^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}",       # ISO format with time
-    r"^\w{3}\s+\d{1,2},\s+\d{4}"               # Jan 01, 2024
+    r"^\d{4}[-/.]\d{1,2}[-/.]\d{1,2}(?:[ T]\d{2}:\d{2}(?::\d{2})?)?$",   # 2024-01-01, 2024.01.01, 2024/01/01
+    r"^\d{1,2}[-/.]\d{1,2}[-/.]\d{4}(?:[ T]\d{2}:\d{2}(?::\d{2})?)?$",   # 01-01-2024, 01/01/2024, 01.01.2024
+    r"^\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}$",                               # 15 Jan 2024, 15 January 2024
+    r"^[A-Za-z]{3,9}\s+\d{1,2},\s+\d{4}$"                               # Jan 15, 2024
 ]
 DATE_REGEX = re.compile("|".join(f"({p})" for p in DATE_PATTERNS))
 
+NON_DATE_IDENTIFIERS = re.compile(
+    r"\b(?:id|uuid|sku|tx|part|serial|vin|hash|guid|code|ref|order|inv)\b|[a-f0-9]{8}-[a-f0-9]{4}",
+    re.IGNORECASE
+)
 
-def is_valid_date_series(series: pd.Series) -> bool:
+
+def is_valid_date_series(series: pd.Series, col_name: str = "") -> bool:
     """
-    Verifies if non-null string entries actually adhere to valid date formats,
-    rejecting UUIDs, SKUs, part numbers, or arbitrary strings containing hyphens.
+    Robust date series verification.
+    Prevents false positives on IDs, UUIDs, SKUs, and version numbers.
     """
-    sample = series.dropna().head(15).astype(str)
+    if NON_DATE_IDENTIFIERS.search(col_name):
+        return False
+
+    sample = series.dropna().head(20).astype(str)
     if len(sample) == 0:
         return False
 
     matches = 0
     for val in sample:
         v = val.strip()
-        # Must match explicit date pattern and cannot contain underscores or typical non-date alphanumeric prefixes
-        if DATE_REGEX.search(v) and not any(p in v.lower() for p in ["id", "sku", "uuid", "tx-", "part"]):
+        if NON_DATE_IDENTIFIERS.search(v):
+            return False
+        if DATE_REGEX.match(v):
             matches += 1
 
-    # At least 80% of sampled values must strictly match date formats
     if (matches / len(sample)) < 0.80:
         return False
 
@@ -203,7 +247,7 @@ def is_valid_date_series(series: pd.Series) -> bool:
         warnings.simplefilter("ignore")
         try:
             parsed = pd.to_datetime(sample, errors="coerce")
-            return parsed.notna().sum() / len(sample) >= 0.80
+            return (parsed.notna().sum() / len(sample)) >= 0.80
         except Exception:
             return False
 
@@ -211,7 +255,7 @@ def is_valid_date_series(series: pd.Series) -> bool:
 def detect_schema(df: pd.DataFrame) -> Dict[str, Any]:
     """
     Feature 3: Automatic identification of numeric, categorical, datetime, boolean types
-    with robust non-date exclusion.
+    with non-date identifier exclusion.
     """
     numeric_cols: List[str] = []
     categorical_cols: List[str] = []
@@ -237,13 +281,13 @@ def detect_schema(df: pd.DataFrame) -> Dict[str, Any]:
             categorical_cols.append(col)
             column_types[col] = "categorical"
         else:
-            if is_valid_date_series(s):
+            if is_valid_date_series(s, col_name=str(col)):
                 datetime_cols.append(col)
                 column_types[col] = "datetime"
             else:
                 n_unique = s.nunique(dropna=True)
                 total_len = len(s)
-                if total_len > 0 and (n_unique / total_len < 0.20 or n_unique < 30):
+                if total_len > 0 and (n_unique / total_len < 0.15 or n_unique < 20):
                     categorical_cols.append(col)
                     column_types[col] = "categorical"
                 else:
