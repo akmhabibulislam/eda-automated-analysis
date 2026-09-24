@@ -148,13 +148,29 @@ def generate_html_report(
     df: pd.DataFrame,
     summary_text: str,
     audit_logs: Optional[List[Dict[str, Any]]] = None,
-    figures: Optional[List[go.Figure]] = None
+    figures: Optional[List[go.Figure]] = None,
+    fingerprint_sha256: Optional[str] = None,
+    provenance: Optional[Dict[str, str]] = None,
+    analysis_parameters: Optional[Dict[str, Any]] = None
 ) -> str:
     """
-    Feature 51: Standalone HTML Analytical Report.
+    Feature 51: Standalone HTML Analytical Report with cryptographic dataset fingerprint,
+    software environment provenance, and parameter audit trail.
     """
     n_rows, n_cols = df.shape
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    fp_display = fingerprint_sha256 if fingerprint_sha256 else "N/A"
+
+    provenance_html = ""
+    if provenance:
+        prov_items = "".join([f"<li><strong>{k}:</strong> {v}</li>" for k, v in provenance.items()])
+        provenance_html = f"""
+        <div class="provenance-box">
+            <h3>Software Environment & Reproducibility Provenance</h3>
+            <ul>{prov_items}</ul>
+        </div>
+        """
 
     preview_table_html = df.head(10).to_html(classes="styled-table", index=False)
     num_df = df.describe().round(2).reset_index()
@@ -208,9 +224,25 @@ def generate_html_report(
             padding-bottom: 12px;
         }}
         .metadata {{
-            font-size: 14px;
+            font-size: 13px;
             color: #6b7280;
+            margin-bottom: 20px;
+            line-height: 1.5;
+        }}
+        .provenance-box {{
+            background: #f8fafc;
+            border: 1px solid #e2e8f0;
+            border-radius: 6px;
+            padding: 12px 16px;
             margin-bottom: 24px;
+            font-size: 12px;
+        }}
+        .provenance-box ul {{
+            margin: 4px 0 0 16px;
+            padding: 0;
+        }}
+        .provenance-box li {{
+            margin-bottom: 2px;
         }}
         h2 {{
             color: #1f2937;
@@ -260,8 +292,11 @@ def generate_html_report(
     <div class="report-wrapper">
         <h1>Automated Data Analysis Report</h1>
         <div class="metadata">
-            Generated on: {timestamp} | Dimensions: {n_rows:,} Rows × {n_cols} Columns
+            Generated on: {timestamp} | Dimensions: {n_rows:,} Rows × {n_cols} Columns<br>
+            <strong>Dataset SHA-256 Fingerprint:</strong> <code>{fp_display}</code>
         </div>
+
+        {provenance_html}
 
         <h2>Executive Narrative</h2>
         <div class="executive-summary">
@@ -294,12 +329,14 @@ def generate_html_report(
 def generate_pdf_report(
     df: pd.DataFrame,
     summary_text: str,
-    audit_logs: Optional[List[Dict[str, Any]]] = None
+    audit_logs: Optional[List[Dict[str, Any]]] = None,
+    fingerprint_sha256: Optional[str] = None,
+    provenance: Optional[Dict[str, str]] = None
 ) -> bytes:
     """
     Feature 52: Printable Executive PDF Report.
     Dynamically wraps text cells in Paragraph flowables to prevent text clipping
-    or page boundary overflow.
+    or page boundary overflow. Embeds SHA-256 fingerprint and software provenance.
     """
     buffer = io.BytesIO()
     margin = 36
@@ -325,15 +362,16 @@ def generate_pdf_report(
     meta_style = ParagraphStyle(
         name="MetaText",
         parent=styles["Normal"],
-        fontSize=9,
+        fontSize=8,
+        leading=11,
         textColor=colors.HexColor("#6b7280"),
-        spaceAfter=14
+        spaceAfter=12
     )
     h2_style = ParagraphStyle(
         name="Heading2Custom",
         parent=styles["Heading2"],
-        fontSize=13,
-        leading=16,
+        fontSize=12,
+        leading=15,
         textColor=colors.HexColor("#1f2937"),
         spaceBefore=10,
         spaceAfter=6
@@ -367,8 +405,14 @@ def generate_pdf_report(
     # Title & Metadata
     elements.append(Paragraph("Executive Data Analysis Report", title_style))
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    elements.append(Paragraph(f"Generated: {timestamp} | Total Rows: {len(df):,} | Total Columns: {len(df.columns)}", meta_style))
-    elements.append(Spacer(1, 8))
+    fp_text = f" | SHA-256: {fingerprint_sha256[:16]}..." if fingerprint_sha256 else ""
+    elements.append(Paragraph(f"Generated: {timestamp} | Total Rows: {len(df):,} | Total Columns: {len(df.columns)}{fp_text}", meta_style))
+
+    if provenance:
+        prov_summary = f"Environment: Python {provenance.get('python_version')} | Pandas {provenance.get('pandas_version')} | NumPy {provenance.get('numpy_version')} | Scikit-Learn {provenance.get('scikit_learn_version')}"
+        elements.append(Paragraph(prov_summary, meta_style))
+
+    elements.append(Spacer(1, 6))
 
     # Executive Narrative
     elements.append(Paragraph("Executive Narrative", h2_style))

@@ -32,7 +32,15 @@ def render_modeling_view(session_manager: DatasetSessionManager, register_fig_ca
         return
 
     dt_cols = df.select_dtypes(include=["datetime", "datetimetz"]).columns.tolist()
-    num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    raw_num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+
+    from backend.ingestion.loaders import detect_schema
+    schema_info = detect_schema(df)
+    semantic_roles = schema_info.get("semantic_roles", {})
+    # Exclude identifiers and UUIDs from modeling, clustering, and PCA
+    num_cols = [c for c in raw_num_cols if semantic_roles.get(c) not in ["identifier", "uuid"]]
+    if not num_cols:
+        num_cols = raw_num_cols
 
     m_tab1, m_tab2, m_tab3, m_tab4, m_tab5 = st.tabs([
         "Time-Series Analysis", "Curve Fitting", "Parametric Function Search", "K-Means & PCA", "Isolation Forest"

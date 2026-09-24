@@ -109,16 +109,60 @@ def compute_missingness_matrix(df: pd.DataFrame) -> Dict[str, Any]:
     }
 
 
-def compute_correlation_matrix(df: pd.DataFrame, method: str = "pearson") -> pd.DataFrame:
+MAX_CORRELATION_FEATURES = 100
+
+
+def compute_correlation_matrix(
+    df: pd.DataFrame,
+    method: str = "pearson",
+    max_features: int = MAX_CORRELATION_FEATURES
+) -> pd.DataFrame:
     """
     Feature 17: Correlation Matrix (Pearson, Spearman, and Kendall coefficients).
+    Filters out constant columns and bounds feature count to prevent matrix singularity and memory stalls.
     """
     num_df = df.select_dtypes(include=[np.number])
-    if num_df.shape[1] < 2:
+    # Filter out zero variance / constant columns
+    valid_cols = [c for c in num_df.columns if num_df[c].dropna().nunique() > 1]
+    if len(valid_cols) < 2:
         return pd.DataFrame()
 
-    corr = num_df.corr(method=method)  # type: ignore
+    if len(valid_cols) > max_features:
+        valid_cols = valid_cols[:max_features]
+
+    corr = num_df[valid_cols].corr(method=method)  # type: ignore
     return corr.round(4)
+
+
+def compute_correlation_matrix_with_sample_sizes(
+    df: pd.DataFrame,
+    method: str = "pearson",
+    max_features: int = MAX_CORRELATION_FEATURES
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Feature 17b: Transparent Correlation Matrix reporting pairwise sample sizes (N used).
+    Informs users when pairwise deletion alters sample coverage across features.
+    Returns: (correlation_matrix, sample_size_matrix)
+    """
+    num_df = df.select_dtypes(include=[np.number])
+    valid_cols = [c for c in num_df.columns if num_df[c].dropna().nunique() > 1]
+    if len(valid_cols) < 2:
+        return pd.DataFrame(), pd.DataFrame()
+
+    if len(valid_cols) > max_features:
+        valid_cols = valid_cols[:max_features]
+
+    sub = num_df[valid_cols]
+    corr_matrix = sub.corr(method=method).round(4)  # type: ignore
+
+    # Calculate pairwise non-null counts
+    n_matrix = pd.DataFrame(index=valid_cols, columns=valid_cols, dtype=int)
+    for c1 in valid_cols:
+        for c2 in valid_cols:
+            n_obs = int((sub[c1].notna() & sub[c2].notna()).sum())
+            n_matrix.loc[c1, c2] = n_obs
+
+    return corr_matrix, n_matrix
 
 
 def detect_highly_correlated_pairs(df: pd.DataFrame, threshold: float = 0.80) -> List[Dict[str, Any]]:
@@ -126,11 +170,12 @@ def detect_highly_correlated_pairs(df: pd.DataFrame, threshold: float = 0.80) ->
     Feature 18: Highly Correlated Feature Pairs (Pairwise Correlation Analysis).
     Identifies predictor pairs exceeding correlation threshold.
     """
-    num_df = df.select_dtypes(include=[np.number]).dropna()
-    if num_df.shape[1] < 2:
+    num_df = df.select_dtypes(include=[np.number])
+    valid_cols = [c for c in num_df.columns if num_df[c].dropna().nunique() > 1]
+    if len(valid_cols) < 2:
         return []
 
-    corr_matrix = num_df.corr(method="pearson").abs()
+    corr_matrix = num_df[valid_cols].corr(method="pearson").abs()
     high_corr_pairs = []
 
     columns = corr_matrix.columns
@@ -140,32 +185,43 @@ def detect_highly_correlated_pairs(df: pd.DataFrame, threshold: float = 0.80) ->
             col2 = columns[j]
             coeff = corr_matrix.loc[col1, col2]
             if coeff >= threshold:
+                n_used = int((num_df[col1].notna() & num_df[col2].notna()).sum())
                 high_corr_pairs.append({
                     "column_1": col1,
                     "column_2": col2,
                     "correlation": round(float(coeff), 4),
+                    "n_observations": n_used,
                     "severity": "Critical" if coeff >= 0.90 else "High"
                 })
 
     return sorted(high_corr_pairs, key=lambda x: x["correlation"], reverse=True)
 
 
-def compute_variance_inflation_factors(df: pd.DataFrame) -> pd.DataFrame:
+def compute_variance_inflation_factors(
+    df: pd.DataFrame,
+    max_features: int = 50
+) -> pd.DataFrame:
     """
     Feature 18b: Variance Inflation Factor (VIF) Multi-Collinearity Calculation.
-    VIF = 1 / (1 - R_i^2) where each feature is regressed against all other numeric predictors.
+    Filters zero-variance features and caps feature count to avoid computational instability and rank deficiency.
     """
     num_df = df.select_dtypes(include=[np.number]).dropna()
-    if num_df.shape[1] < 2 or len(num_df) < num_df.shape[1]:
+    # Filter constant columns
+    valid_cols = [c for c in num_df.columns if num_df[c].nunique() > 1]
+
+    if len(valid_cols) < 2 or len(num_df) < len(valid_cols):
         return pd.DataFrame(columns=["Feature", "VIF", "Collinearity_Status"])
 
-    vif_records = []
-    cols = num_df.columns.tolist()
+    if len(valid_cols) > max_features:
+        valid_cols = valid_cols[:max_features]
 
-    for col in cols:
-        y = num_df[col].values
-        other_cols = [c for c in cols if c != col]
-        X = num_df[other_cols].values
+    filtered_df = num_df[valid_cols]
+    vif_records = []
+
+    for col in valid_cols:
+        y = filtered_df[col].values
+        other_cols = [c for c in valid_cols if c != col]
+        X = filtered_df[other_cols].values
         # Add intercept column
         X_with_const = np.column_stack([np.ones(len(X)), X])
 

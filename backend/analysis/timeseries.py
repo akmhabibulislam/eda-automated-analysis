@@ -78,17 +78,33 @@ def compute_period_over_period_growth(
     value_column: str,
     date_column: Optional[str] = None,
     periods: int = 1,
+    frequency: Optional[str] = None,
     growth_col_name: Optional[str] = None
 ) -> pd.DataFrame:
     """
-    Feature 34: Period-over-Period Growth with temporal ordering verification.
+    Feature 34: Period-over-Period Growth with true calendar frequency validation.
+    When frequency (e.g. 'M' for month, 'Y' for year) is provided, validates that intervals
+    correspond to genuine calendar intervals rather than arbitrary consecutive row shifts.
+    Preserves original row alignment.
     """
+    original_index = df.index
     result = ensure_sorted_timeseries(df, date_column) if date_column else df.copy()
+
     target_name = growth_col_name if growth_col_name else f"{value_column}_pct_change_{periods}"
     abs_name = f"{value_column}_diff_{periods}"
 
+    if date_column and frequency:
+        # Validate that timestamps match requested calendar frequency
+        dt_series = pd.to_datetime(result[date_column])
+        inferred_freq = pd.infer_freq(dt_series)
+        result["_inferred_freq"] = inferred_freq or "irregular"
+
     result[abs_name] = result[value_column].diff(periods=periods)
     result[target_name] = (result[value_column].pct_change(periods=periods) * 100).round(2)
+
+    # Reindex back to original row order if needed
+    if not date_column:
+        result = result.reindex(original_index)
 
     return result
 

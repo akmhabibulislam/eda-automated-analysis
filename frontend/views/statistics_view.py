@@ -36,6 +36,16 @@ def render_statistics_view(session_manager: DatasetSessionManager):
     num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
     cat_cols = [c for c in df.columns if isinstance(df[c].dtype, (pd.CategoricalDtype, pd.StringDtype)) or df[c].dtype == "object"]
 
+    from backend.ingestion.loaders import detect_schema
+    schema_info = detect_schema(df)
+    semantic_roles = schema_info.get("semantic_roles", {})
+    # Filter raw identifiers out of analytical numerical candidates
+    analytical_num_cols = [
+        c for c in num_cols if semantic_roles.get(c) not in ["identifier", "uuid"]
+    ]
+    if not analytical_num_cols:
+        analytical_num_cols = num_cols
+
     s_tab1, s_tab2, s_tab3, s_tab4, s_tab5, s_tab6 = st.tabs([
         "Descriptive Stats", "Correlations & VIF", "T-Tests & ANOVA", "Categorical Tests", "Distribution Fitting", "Multiple Testing Correction"
     ])
@@ -51,51 +61,62 @@ def render_statistics_view(session_manager: DatasetSessionManager):
             st.dataframe(sk_df, use_container_width=True)
 
     with s_tab2:
-        st.markdown("##### Correlation Matrix")
+        st.markdown("##### Correlation Matrix with Sample Coverage (N used)")
+        st.caption("Displays pairwise coefficients alongside exact non-null observation counts to surface pairwise deletion bias.")
         c_meth = st.selectbox("Method", ["pearson", "spearman", "kendall"])
-        corr_m = compute_correlation_matrix(df, method=c_meth)
+        from backend.analysis.statistics import compute_correlation_matrix_with_sample_sizes
+        corr_m, n_m = compute_correlation_matrix_with_sample_sizes(df[analytical_num_cols], method=c_meth)
         if not corr_m.empty:
+            st.markdown("**Correlation Coefficients**")
             st.dataframe(corr_m, use_container_width=True)
+            st.markdown("**Pairwise Sample Size (N observations used)**")
+            st.dataframe(n_m, use_container_width=True)
 
         st.markdown("##### Highly Correlated Feature Pairs (Pairwise Correlation >= 0.80)")
-        corr_pairs = detect_highly_correlated_pairs(df, threshold=0.80)
+        corr_pairs = detect_highly_correlated_pairs(df[analytical_num_cols], threshold=0.80)
         if corr_pairs:
             for w in corr_pairs:
-                st.warning(f"{w['severity']} Correlation: `{w['column_1']}` and `{w['column_2']}` (Coeff: {w['correlation']})")
+                st.warning(f"{w['severity']} Correlation: `{w['column_1']}` and `{w['column_2']}` (r={w['correlation']}, N={w.get('n_observations')})")
         else:
             st.success("No feature pairs exceed the 0.80 correlation threshold.")
 
         st.markdown("##### Variance Inflation Factor (VIF) Multi-Collinearity Calculation")
-        vif_df = compute_variance_inflation_factors(df)
+        vif_df = compute_variance_inflation_factors(df[analytical_num_cols])
         if not vif_df.empty:
             st.dataframe(vif_df, use_container_width=True)
 
     with s_tab3:
-        st.markdown("##### T-Tests & One-Way ANOVA")
+        st.markdown("##### Parametric Hypothesis Testing (T-Tests & One-Way ANOVA)")
+        st.caption("Includes configurable significance threshold (alpha), effect sizes (Cohen's d, Eta-squared), confidence intervals, and Tukey HSD post-hoc testing.")
+        alpha_val = st.selectbox("Significance Level (Alpha)", [0.05, 0.01, 0.10], index=0)
+
         t_col1, t_col2 = st.columns(2)
         with t_col1:
             st.markdown("**T-Test Analysis (Paired & Independent)**")
-            if len(num_cols) >= 2:
-                tt_s1 = st.selectbox("Sample 1", num_cols, index=0)
-                tt_s2 = st.selectbox("Sample 2", num_cols, index=1)
+            if len(analytical_num_cols) >= 2:
+                tt_s1 = st.selectbox("Sample 1", analytical_num_cols, index=0)
+                tt_s2 = st.selectbox("Sample 2", analytical_num_cols, index=1)
                 tt_type = st.selectbox("Design", ["independent", "paired"])
                 if st.button("Run T-Test"):
                     try:
-                        res_tt = run_t_test(df[tt_s1], df[tt_s2], test_type=tt_type)
+                        res_tt = run_t_test(df[tt_s1], df[tt_s2], test_type=tt_type, alpha=alpha_val)
                         st.json(res_tt)
                     except Exception as e:
                         st.error(f"T-Test error: {str(e)}")
 
         with t_col2:
-            st.markdown("**ANOVA (F-Test)**")
-            if num_cols and cat_cols:
-                an_val = st.selectbox("Metric", num_cols)
+            st.markdown("**ANOVA (F-Test) & Tukey HSD**")
+            if analytical_num_cols and cat_cols:
+                an_val = st.selectbox("Metric", analytical_num_cols)
                 an_grp = st.selectbox("Group Factor", cat_cols)
                 if st.button("Run ANOVA"):
                     try:
                         groups = [group[an_val].values for _, group in df.groupby(an_grp, observed=False)]
-                        res_an = run_anova(groups)
-                        st.json(res_an)
+                        res_an = run_anova(groups, alpha=alpha_val)
+                        st.json({k: v for k, v in res_an.items() if k != "post_hoc_tukey"})
+                        if res_an.get("post_hoc_tukey") is not None:
+                            st.markdown("**Tukey HSD Post-Hoc Pairwise Comparisons**")
+                            st.dataframe(res_an["post_hoc_tukey"], use_container_width=True)
                     except Exception as e:
                         st.error(f"ANOVA error: {str(e)}")
 

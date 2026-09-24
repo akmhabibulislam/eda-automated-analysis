@@ -77,12 +77,25 @@ def render_reporting_view(session_manager: DatasetSessionManager, recent_figures
         rep_c1, rep_c2, rep_c3 = st.columns(3)
         with rep_c1:
             st.markdown("**Standalone HTML Report**")
-            html_out = generate_html_report(df, summary_text=exec_text, audit_logs=lineage_logs, figures=recent_figures)
+            html_out = generate_html_report(
+                df,
+                summary_text=exec_text,
+                audit_logs=lineage_logs,
+                figures=recent_figures,
+                fingerprint_sha256=session_manager.fingerprint_sha256,
+                provenance=session_manager.provenance
+            )
             st.download_button("Download HTML Report", data=html_out, file_name="datasight_report.html", mime="text/html")
 
         with rep_c2:
             st.markdown("**Executive PDF Report**")
-            pdf_out = generate_pdf_report(df, summary_text=exec_text, audit_logs=lineage_logs)
+            pdf_out = generate_pdf_report(
+                df,
+                summary_text=exec_text,
+                audit_logs=lineage_logs,
+                fingerprint_sha256=session_manager.fingerprint_sha256,
+                provenance=session_manager.provenance
+            )
             st.download_button("Download PDF Report", data=pdf_out, file_name="datasight_report.pdf", mime="application/pdf")
 
         with rep_c3:

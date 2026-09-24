@@ -72,10 +72,11 @@ def run_t_test(
     sample_a: Union[np.ndarray, pd.Series],
     sample_b: Union[np.ndarray, pd.Series],
     test_type: str = "independent",
-    equal_var: bool = False
+    equal_var: bool = False,
+    alpha: float = 0.05
 ) -> Dict[str, Any]:
     """
-    Feature 27: Independent and Paired T-Tests.
+    Feature 27: Independent and Paired T-Tests with configurable alpha, effect size, and confidence intervals.
     For paired tests, index-aligns observations and drops missing pairs simultaneously.
     """
     if test_type == "paired":
@@ -95,6 +96,18 @@ def run_t_test(
 
         stat, p_val = stats.ttest_rel(clean_a, clean_b)
         test_name = "Paired Student's T-Test"
+        diff = clean_a - clean_b
+        mean_diff = float(np.mean(diff))
+        std_diff = float(np.std(diff, ddof=1)) if len(diff) > 1 else 0.0
+        # Cohen's d for paired samples
+        cohens_d = (mean_diff / std_diff) if std_diff > 0 else 0.0
+
+        # Confidence interval for paired mean difference
+        dof = len(clean_a) - 1
+        t_crit = float(stats.t.ppf(1.0 - alpha / 2.0, dof)) if dof > 0 else 1.96
+        margin_error = t_crit * (std_diff / np.sqrt(len(diff))) if len(diff) > 0 else 0.0
+        ci_lower = mean_diff - margin_error
+        ci_upper = mean_diff + margin_error
 
     elif test_type == "independent":
         clean_a = np.asarray(sample_a)[~pd.isna(sample_a)].astype(float)
@@ -109,10 +122,33 @@ def run_t_test(
         stat, p_val = stats.ttest_ind(clean_a, clean_b, equal_var=equal_var)
         test_name = "Welch's T-Test (Unequal Variance)" if not equal_var else "Student's T-Test (Equal Variance)"
 
+        mean_a = float(np.mean(clean_a))
+        mean_b = float(np.mean(clean_b))
+        mean_diff = mean_a - mean_b
+
+        var_a = float(np.var(clean_a, ddof=1))
+        var_b = float(np.var(clean_b, ddof=1))
+        n_a, n_b = len(clean_a), len(clean_b)
+
+        # Pooled standard deviation for Cohen's d
+        s_pooled = np.sqrt(((n_a - 1) * var_a + (n_b - 1) * var_b) / (n_a + n_b - 2)) if (n_a + n_b > 2) else 1.0
+        cohens_d = (mean_diff / s_pooled) if s_pooled > 0 else 0.0
+
+        # Welch-Satterthwaite or Student standard error
+        if equal_var:
+            se_diff = s_pooled * np.sqrt(1.0 / n_a + 1.0 / n_b)
+            dof = n_a + n_b - 2
+        else:
+            se_diff = np.sqrt(var_a / n_a + var_b / n_b)
+            dof = int(((var_a / n_a + var_b / n_b) ** 2) / (((var_a / n_a) ** 2) / (n_a - 1) + ((var_b / n_b) ** 2) / (n_b - 1))) if (n_a > 1 and n_b > 1) else 1
+
+        t_crit = float(stats.t.ppf(1.0 - alpha / 2.0, max(1, dof)))
+        ci_lower = mean_diff - t_crit * se_diff
+        ci_upper = mean_diff + t_crit * se_diff
+
     else:
         raise ValueError("test_type must be either 'independent' or 'paired'")
 
-    alpha = 0.05
     significant = bool(p_val < alpha)
 
     return {
@@ -126,17 +162,26 @@ def run_t_test(
         "n_obs_b": len(clean_b),
         "mean_sample_a": round(float(np.mean(clean_a)), 4),
         "mean_sample_b": round(float(np.mean(clean_b)), 4),
+        "effect_size_cohens_d": round(float(cohens_d), 4),
+        "confidence_interval": (round(float(ci_lower), 4), round(float(ci_upper), 4)),
+        "ci_confidence_level": int((1.0 - alpha) * 100),
         "conclusion": (
-            "Reject null hypothesis: Significant difference detected between groups (p < 0.05)."
+            f"Reject null hypothesis: Significant difference detected between groups (p < {alpha})."
             if significant
-            else "Fail to reject null hypothesis: No statistically significant difference detected (p >= 0.05)."
+            else f"Fail to reject null hypothesis: No statistically significant difference detected (p >= {alpha})."
         )
     }
 
 
-def run_anova(groups: List[np.ndarray], group_names: Optional[List[str]] = None) -> Dict[str, Any]:
+def run_anova(
+    groups: List[np.ndarray],
+    group_names: Optional[List[str]] = None,
+    alpha: float = 0.05,
+    run_post_hoc: bool = True
+) -> Dict[str, Any]:
     """
-    Feature 28: One-Way ANOVA (Analysis of Variance).
+    Feature 28: One-Way ANOVA with configurable alpha, Eta-squared effect size,
+    and optional Tukey HSD post-hoc pairwise testing.
     """
     clean_groups = []
     for g in groups:
@@ -148,8 +193,14 @@ def run_anova(groups: List[np.ndarray], group_names: Optional[List[str]] = None)
         raise ValueError("ANOVA requires at least 2 groups with >= 2 finite observations each.")
 
     stat, p_val = stats.f_oneway(*clean_groups)
-    alpha = 0.05
     significant = bool(p_val < alpha)
+
+    # Compute Eta-Squared effect size: SS_between / SS_total
+    all_vals = np.concatenate(clean_groups)
+    grand_mean = np.mean(all_vals)
+    ss_total = np.sum((all_vals - grand_mean) ** 2)
+    ss_between = np.sum([len(g) * ((np.mean(g) - grand_mean) ** 2) for g in clean_groups])
+    eta_squared = float(ss_between / ss_total) if ss_total > 0 else 0.0
 
     group_summaries = []
     for idx, g in enumerate(clean_groups):
@@ -161,6 +212,26 @@ def run_anova(groups: List[np.ndarray], group_names: Optional[List[str]] = None)
             "std": round(float(np.std(g, ddof=1)), 4)
         })
 
+    # Optional Tukey HSD post-hoc analysis
+    post_hoc_df = None
+    if run_post_hoc and len(clean_groups) >= 2:
+        try:
+            from statsmodels.stats.multicomp import pairwise_tukeyhsd
+            flat_data = []
+            flat_labels = []
+            for idx, g in enumerate(clean_groups):
+                name = group_names[idx] if group_names and idx < len(group_names) else f"Group_{idx+1}"
+                flat_data.extend(g)
+                flat_labels.extend([name] * len(g))
+
+            tukey = pairwise_tukeyhsd(endog=flat_data, groups=flat_labels, alpha=alpha)
+            post_hoc_df = pd.DataFrame(
+                data=tukey._results_table.data[1:],
+                columns=tukey._results_table.data[0]
+            )
+        except Exception:
+            post_hoc_df = None
+
     return {
         "test_name": "One-Way ANOVA (F-Test)",
         "f_statistic": round(float(stat), 4),
@@ -168,22 +239,28 @@ def run_anova(groups: List[np.ndarray], group_names: Optional[List[str]] = None)
         "p_value_formatted": f"{p_val:.4e}" if p_val < 0.0001 else f"{p_val:.4f}",
         "alpha": alpha,
         "is_significant": significant,
+        "eta_squared": round(eta_squared, 4),
         "groups": group_summaries,
+        "post_hoc_tukey": post_hoc_df,
         "conclusion": (
-            "Reject null hypothesis: At least one group mean differs significantly from the others (p < 0.05)."
+            f"Reject null hypothesis: At least one group mean differs significantly from the others (p < {alpha})."
             if significant
-            else "Fail to reject null hypothesis: No statistically significant difference among group means (p >= 0.05)."
+            else f"Fail to reject null hypothesis: No statistically significant difference among group means (p >= {alpha})."
         )
     }
 
 
-def run_chi_square(contingency_table: pd.DataFrame) -> Dict[str, Any]:
+def run_chi_square(contingency_table: pd.DataFrame, alpha: float = 0.05) -> Dict[str, Any]:
     """
-    Feature 29: Chi-Square Test of Independence.
+    Feature 29: Chi-Square Test of Independence with configurable alpha and Cramer's V effect size.
     """
     stat, p_val, dof, expected = stats.chi2_contingency(contingency_table)
-    alpha = 0.05
     significant = bool(p_val < alpha)
+
+    # Cramer's V effect size calculation
+    total_obs = np.sum(contingency_table.values)
+    min_dim = min(contingency_table.shape) - 1
+    cramers_v = np.sqrt(stat / (total_obs * min_dim)) if (total_obs > 0 and min_dim > 0) else 0.0
 
     expected_df = pd.DataFrame(expected, index=contingency_table.index, columns=contingency_table.columns).round(2)
 
@@ -195,29 +272,29 @@ def run_chi_square(contingency_table: pd.DataFrame) -> Dict[str, Any]:
         "p_value_formatted": f"{p_val:.4e}" if p_val < 0.0001 else f"{p_val:.4f}",
         "alpha": alpha,
         "is_significant": significant,
+        "cramers_v": round(float(cramers_v), 4),
         "expected_frequencies": expected_df,
         "conclusion": (
-            "Reject null hypothesis: Significant association between the two categorical variables (p < 0.05)."
+            f"Reject null hypothesis: Significant association between the two categorical variables (p < {alpha})."
             if significant
-            else "Fail to reject null hypothesis: Variables appear independent (p >= 0.05)."
+            else f"Fail to reject null hypothesis: Variables appear independent (p >= {alpha})."
         )
     }
 
 
 def run_non_parametric_tests(
     groups: List[np.ndarray],
-    group_names: Optional[List[str]] = None
+    group_names: Optional[List[str]] = None,
+    alpha: float = 0.05
 ) -> Dict[str, Any]:
     """
-    Feature 30: Mann-Whitney U or Kruskal-Wallis Non-Parametric Tests.
+    Feature 30: Mann-Whitney U or Kruskal-Wallis Non-Parametric Tests with configurable alpha.
     """
     clean_groups = [np.asarray(g)[~pd.isna(g)].astype(float) for g in groups]
     clean_groups = [g for g in clean_groups if len(g) >= 2 and not np.isinf(g).any()]
 
     if len(clean_groups) < 2:
         raise ValueError("Non-parametric test requires at least 2 valid groups.")
-
-    alpha = 0.05
 
     if len(clean_groups) == 2:
         stat, p_val = stats.mannwhitneyu(clean_groups[0], clean_groups[1], alternative="two-sided")
@@ -228,11 +305,12 @@ def run_non_parametric_tests(
             "u_statistic": round(float(stat), 4),
             "p_value": float(p_val),
             "p_value_formatted": f"{p_val:.4e}" if p_val < 0.0001 else f"{p_val:.4f}",
+            "alpha": alpha,
             "is_significant": significant,
             "conclusion": (
-                "Reject null hypothesis: Distributions of the two groups differ significantly (p < 0.05)."
+                f"Reject null hypothesis: Distributions of the two groups differ significantly (p < {alpha})."
                 if significant
-                else "Fail to reject null hypothesis: No significant distributional difference detected (p >= 0.05)."
+                else f"Fail to reject null hypothesis: No significant distributional difference detected (p >= {alpha})."
             )
         }
     else:
@@ -244,11 +322,12 @@ def run_non_parametric_tests(
             "h_statistic": round(float(stat), 4),
             "p_value": float(p_val),
             "p_value_formatted": f"{p_val:.4e}" if p_val < 0.0001 else f"{p_val:.4f}",
+            "alpha": alpha,
             "is_significant": significant,
             "conclusion": (
-                "Reject null hypothesis: Significant difference among population medians across groups (p < 0.05)."
+                f"Reject null hypothesis: Significant difference among population medians across groups (p < {alpha})."
                 if significant
-                else "Fail to reject null hypothesis: No significant median differences detected (p >= 0.05)."
+                else f"Fail to reject null hypothesis: No significant difference among group medians (p >= {alpha})."
             )
         }
 
