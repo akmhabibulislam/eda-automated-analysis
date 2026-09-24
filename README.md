@@ -1,8 +1,8 @@
 # DataSight Analytics Platform
 
-Production-ready, enterprise-grade Automated Data Analysis Web Application built with Python, Streamlit, Pandas, SciPy, Scikit-Learn, and Plotly.
+A modular, automated exploratory data analysis (EDA) and analytical computing platform built with Python, Streamlit, Pandas, SciPy, Scikit-Learn, and Plotly.
 
-The application serves as a standalone exploratory data analysis (EDA), hypothesis testing, mathematical modeling, time-series decomposition, and executive reporting engine for data analysts and data scientists without requiring machine learning model training.
+The application serves as a standalone exploratory data analysis, hypothesis testing, mathematical modeling, time-series decomposition, and executive reporting engine for data analysts and data scientists without requiring machine learning model training.
 
 ---
 

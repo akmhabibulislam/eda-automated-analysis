@@ -31,8 +31,19 @@ from backend.cleaning.cleaning import (
     impute_missing_values,
     analyze_cleaning_recommendations,
     run_automated_cleaning,
+    cast_data_types,
+    drop_missing_values,
     AuditLogger
 )
+from backend.core.validation import (
+    validate_dataframe_not_empty,
+    validate_unique_columns,
+    validate_numeric_finite_column,
+    validate_non_zero_variance,
+    validate_cardinality_guard,
+    ValidationError
+)
+from backend.core.lineage import DatasetSessionManager, LineageRecord
 from backend.cleaning.wrangling import (
     add_custom_formula_column,
     bin_continuous_column,
@@ -49,7 +60,8 @@ from backend.analysis.hypothesis import (
     run_t_test,
     run_anova,
     run_chi_square,
-    fit_distributions
+    fit_distributions,
+    apply_multiple_testing_correction
 )
 from backend.analysis.timeseries import (
     ensure_sorted_timeseries,
@@ -316,6 +328,103 @@ class TestDataSightCorrectness(unittest.TestCase):
         with self.assertRaises(ValueError):
             decompose_seasonality_trend(ts_df, "date", "val", period=12)
 
+    # -------------------------------------------------------------
+    # 7. Hardened Architecture & Validation Layer
+    # -------------------------------------------------------------
+
+    def test_validation_layer_inf_rejection(self):
+        df_inf = pd.DataFrame({"val": [1.0, np.inf, 3.0]})
+        with self.assertRaises(ValidationError):
+            validate_numeric_finite_column(df_inf, "val")
+
+        df_neginf = pd.DataFrame({"val": [1.0, -np.inf, 3.0]})
+        with self.assertRaises(ValidationError):
+            validate_numeric_finite_column(df_neginf, "val")
+
+        df_valid = pd.DataFrame({"val": [1.0, np.nan, 3.0, 4.0]})
+        clean = validate_numeric_finite_column(df_valid, "val")
+        self.assertEqual(len(clean), 3)
+
+    def test_validation_layer_cardinality_guard(self):
+        df_cats = pd.DataFrame({"cat": [f"c_{i}" for i in range(150)]})
+        with self.assertRaises(ValidationError):
+            validate_cardinality_guard(df_cats, "cat", max_cardinality=100)
+
+        # Passes when within threshold
+        n = validate_cardinality_guard(df_cats, "cat", max_cardinality=200)
+        self.assertEqual(n, 150)
+
+    def test_validation_layer_duplicate_columns(self):
+        df_dup = pd.DataFrame([[1, 2]], columns=["col_a", "col_a"])
+        with self.assertRaises(ValidationError):
+            validate_unique_columns(df_dup)
+
+    def test_nullable_integer_downcasting_with_nan(self):
+        # A float column containing whole numbers and NaN
+        df = pd.DataFrame({"counts": [10.0, 20.0, np.nan, 40.0]})
+        opt_df, meta = optimize_dataframe_memory(df, downcast_integers=True)
+        # Should be downcast to nullable Int8 without crashing
+        self.assertEqual(str(opt_df["counts"].dtype), "Int8")
+        self.assertTrue(pd.isna(opt_df["counts"].iloc[2]))
+        self.assertEqual(opt_df["counts"].iloc[0], 10)
+
+    def test_column_header_standardization_collision_guard(self):
+        # Two columns that would both sanitize to 'test_metric'
+        df = pd.DataFrame(columns=["Test Metric", "test_metric"])
+        std_df, mapping = standardize_column_headers(df, case_style="snake_case")
+        self.assertEqual(list(std_df.columns), ["test_metric", "test_metric_2"])
+        self.assertEqual(mapping["Test Metric"], "test_metric")
+        self.assertEqual(mapping["test_metric"], "test_metric_2")
+
+    def test_data_type_casting_unparsed_token_accounting(self):
+        df = pd.DataFrame({"numbers": ["10", "20", "invalid_number", "40"]})
+        cast_df, unparsed = cast_data_types(df, {"numbers": "int64"})
+        self.assertEqual(unparsed.get("numbers"), 1)
+        self.assertTrue(pd.isna(cast_df["numbers"].iloc[2]))
+        self.assertEqual(cast_df["numbers"].iloc[0], 10)
+
+    def test_multiple_testing_correction(self):
+        # 4 p-values
+        raw_p = [0.01, 0.04, 0.03, 0.20]
+        # Bonferroni
+        res_bonf = apply_multiple_testing_correction(raw_p, method="bonferroni", alpha=0.05)
+        self.assertEqual(res_bonf["adjusted_p_values"], [0.04, 0.16, 0.12, 0.80])
+        self.assertEqual(res_bonf["significant"], [True, False, False, False])
+
+        # Benjamini-Hochberg (FDR)
+        res_bh = apply_multiple_testing_correction(raw_p, method="benjamini_hochberg", alpha=0.05)
+        self.assertTrue(len(res_bh["adjusted_p_values"]) == 4)
+        # Adjusted p-values must be monotonic when sorted
+        sorted_bh = sorted(res_bh["adjusted_p_values"])
+        self.assertTrue(all(x <= y for x, y in zip(sorted_bh, sorted_bh[1:])))
+
+    def test_dataset_session_manager_and_lineage(self):
+        manager = DatasetSessionManager()
+        df_init = pd.DataFrame({"a": [1, 2, 3], "b": [4, 5, 6]})
+        manager.load_dataset(df_init, dataset_name="TestSet")
+        self.assertEqual(manager.version, 1)
+
+        # Modify current df
+        df_next = pd.DataFrame({"a": [1, 2], "b": [4, 5]})
+        manager.update_current_df(
+            new_df=df_next,
+            operation_name="Filter",
+            parameters={"limit": 2},
+            description="Filtered rows"
+        )
+        self.assertEqual(manager.version, 2)
+        self.assertEqual(len(manager.current_df), 2)
+        # Immutable original unchanged
+        self.assertEqual(len(manager.original_df), 3)
+
+        # Reset to original
+        manager.reset_to_original()
+        self.assertEqual(len(manager.current_df), 3)
+
+        lineage_df = manager.get_lineage_dataframe()
+        self.assertEqual(len(lineage_df), 3)  # Ingestion, Filter, Reset
+
 
 if __name__ == "__main__":
     unittest.main()
+
