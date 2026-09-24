@@ -8,7 +8,7 @@ Provides reusable validation routines for all analytical modules:
 - Cardinality guards for pivoting, groupbys, and categorical plotting
 """
 
-from typing import List, Optional, Tuple, Dict, Any
+from typing import List, Optional, Tuple, Dict, Any, Union
 import numpy as np
 import pandas as pd
 
@@ -88,3 +88,95 @@ def validate_cardinality_guard(df: pd.DataFrame, column: str, max_cardinality: i
             f"exceeding the safety limit of {max_cardinality}. Please group or filter categories first."
         )
     return n_unique
+
+
+def sanitize_and_report_numeric_policy(
+    df: pd.DataFrame,
+    columns: Optional[List[str]] = None,
+    allow_inf: bool = False,
+    coerce_invalid: bool = False
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """
+    Global NaN/Inf/NaT Policy:
+    Ensures uniform accounting and handling of missing, infinite, and unparseable values across modules.
+    Returns: (cleaned_df, report)
+    """
+    target_cols = columns if columns is not None else [
+        c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])
+    ]
+    report: Dict[str, Any] = {
+        "columns_evaluated": target_cols,
+        "dropped_rows_count": 0,
+        "infinite_values_found": {},
+        "nan_values_found": {},
+        "action_taken": "coerced" if coerce_invalid else "validated"
+    }
+
+    result = df.copy()
+
+    for col in target_cols:
+        if col not in result.columns:
+            continue
+        s = result[col]
+        nan_count = int(s.isna().sum())
+        if nan_count > 0:
+            report["nan_values_found"][col] = nan_count
+
+        if pd.api.types.is_numeric_dtype(s):
+            arr = s.to_numpy(dtype=float)
+            inf_count = int(np.isinf(arr).sum())
+            if inf_count > 0:
+                report["infinite_values_found"][col] = inf_count
+                if not allow_inf:
+                    if coerce_invalid:
+                        result[col] = result[col].replace([np.inf, -np.inf], np.nan)
+                    else:
+                        raise ValidationError(
+                            f"Column '{col}' violates policy with {inf_count} infinite value(s). "
+                            f"Infinite values must be sanitized before processing."
+                        )
+
+    return result, report
+
+
+def validate_merge_safety(
+    left_df: pd.DataFrame,
+    right_df: pd.DataFrame,
+    how: str,
+    left_on: Optional[Union[str, List[str]]] = None,
+    right_on: Optional[Union[str, List[str]]] = None,
+    on: Optional[Union[str, List[str]]] = None,
+    max_output_rows: int = 500000
+) -> Dict[str, Any]:
+    """
+    Resource guard: checks for potential Cartesian explosion before performing merge.
+    """
+    l_keys = [on] if isinstance(on, str) else (on or ([left_on] if isinstance(left_on, str) else (left_on or [])))
+    r_keys = [on] if isinstance(on, str) else (on or ([right_on] if isinstance(right_on, str) else (right_on or [])))
+
+    if not l_keys or not r_keys:
+        return {"is_safe": True, "estimated_max_rows": len(left_df)}
+
+    # Estimate join explosion potential by checking max duplicate key frequency
+    max_left_key_freq = int(left_df.groupby(l_keys, observed=True).size().max()) if len(left_df) > 0 else 0
+    max_right_key_freq = int(right_df.groupby(r_keys, observed=True).size().max()) if len(right_df) > 0 else 0
+
+    estimated_max = max(len(left_df), len(right_df))
+    if max_left_key_freq > 1 and max_right_key_freq > 1:
+        # Many-to-many relationship
+        estimated_max = min(len(left_df) * max_right_key_freq, max_output_rows + 1)
+
+    if estimated_max > max_output_rows:
+        raise ValidationError(
+            f"Merge Resource Guard: Potential Cartesian explosion detected! "
+            f"Estimated possible join size could reach {estimated_max:,} rows, "
+            f"exceeding maximum permitted safety ceiling of {max_output_rows:,} rows."
+        )
+
+    return {
+        "is_safe": True,
+        "max_left_key_freq": max_left_key_freq,
+        "max_right_key_freq": max_right_key_freq,
+        "is_many_to_many": bool(max_left_key_freq > 1 and max_right_key_freq > 1)
+    }
+

@@ -151,21 +151,43 @@ def load_dataset(
     return df, metadata
 
 
-DISALLOWED_SQL_KEYWORDS = ["DROP", "DELETE", "UPDATE", "INSERT", "ALTER", "TRUNCATE", "REPLACE", "CREATE", "GRANT", "REVOKE"]
+DISALLOWED_SQL_KEYWORDS = [
+    "DROP", "DELETE", "UPDATE", "INSERT", "ALTER", "TRUNCATE",
+    "REPLACE", "CREATE", "GRANT", "REVOKE", "EXEC", "EXECUTE",
+    "MERGE", "CALL", "INTO", "OUTFILE", "DUMPFILE"
+]
 
 
 def load_from_database(
     connection_string: str,
     query: str,
     auto_optimize: bool = True,
-    max_rows: int = 100000
+    max_rows: int = 100000,
+    timeout_seconds: int = 15
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     """
-    Connect to SQL databases with database-side LIMIT injection and read-only validation.
+    Connect to SQL databases with multi-layered security:
+    - Multi-statement execution blocking (rejects semicolon query chaining)
+    - Keyword blacklist rejection
+    - Read-only transaction enforcement
+    - Strict database-side LIMIT injection
+    - Socket/statement execution timeout
     """
-    clean_query = query.strip().rstrip(";")
+    clean_query = query.strip()
+    if clean_query.endswith(";"):
+        clean_query = clean_query[:-1].strip()
+
+    # Reject query chaining / stacked queries
+    if ";" in clean_query:
+        raise ValueError("Security Violation: Multiple SQL statements or query chaining via ';' are strictly forbidden.")
+
+    # Block comment-based SQL injection obfuscation
+    if "--" in clean_query or "/*" in clean_query:
+        raise ValueError("Security Violation: SQL comments are not permitted in analytical queries.")
+
     upper_query = clean_query.upper()
 
+    # Require SELECT or WITH (CTE)
     if not (upper_query.startswith("SELECT") or upper_query.startswith("WITH")):
         raise ValueError("Security Violation: Only SELECT and WITH (CTE) queries are permitted.")
 
@@ -174,14 +196,29 @@ def load_from_database(
         if re.search(pattern, upper_query):
             raise ValueError(f"Security Violation: Prohibited query keyword '{kw}' detected.")
 
-    # Inject database-side LIMIT if not present to prevent massive server queries
-    if not re.search(r"\bLIMIT\s+\d+\b", upper_query):
+    # Inject database-side LIMIT if not present or replace if larger than max_rows
+    limit_match = re.search(r"\bLIMIT\s+(\d+)\b", upper_query)
+    if not limit_match:
         executed_query = f"{clean_query} LIMIT {max_rows}"
     else:
-        executed_query = clean_query
+        existing_limit = int(limit_match.group(1))
+        if existing_limit > max_rows:
+            executed_query = re.sub(r"\bLIMIT\s+\d+\b", f"LIMIT {max_rows}", clean_query, flags=re.IGNORECASE)
+        else:
+            executed_query = clean_query
 
-    # Configure read-only connection
-    engine = create_engine(connection_string, execution_options={"isolation_level": "AUTOCOMMIT"})
+    # Configure read-only connection with execution timeout
+    connect_args = {}
+    if "sqlite" in connection_string.lower():
+        connect_args["timeout"] = timeout_seconds
+    elif "postgres" in connection_string.lower():
+        connect_args["options"] = f"-c statement_timeout={timeout_seconds * 1000}"
+
+    engine = create_engine(
+        connection_string,
+        execution_options={"isolation_level": "AUTOCOMMIT"},
+        connect_args=connect_args
+    )
 
     with engine.connect() as conn:
         df = pd.read_sql(text(executed_query), conn)
@@ -210,9 +247,18 @@ DATE_PATTERNS = [
 DATE_REGEX = re.compile("|".join(f"({p})" for p in DATE_PATTERNS))
 
 NON_DATE_IDENTIFIERS = re.compile(
-    r"\b(?:id|uuid|sku|tx|part|serial|vin|hash|guid|code|ref|order|inv)\b|[a-f0-9]{8}-[a-f0-9]{4}",
+    r"(?:^|[_\W])(?:id|uuid|sku|tx|part|serial|vin|hash|guid|code|ref|order|inv)(?:[_\W]|$)|[a-f0-9]{8}-[a-f0-9]{4}",
     re.IGNORECASE
 )
+
+# Regex patterns for semantic role inference
+SEMANTIC_PATTERNS = {
+    "uuid": re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$", re.IGNORECASE),
+    "email": re.compile(r"^[\w\.-]+@[\w\.-]+\.\w+$"),
+    "phone": re.compile(r"^\+?[\d\s\-\(\)]{7,20}$"),
+    "currency": re.compile(r"^[\$€£¥₹]\s?[\d,]+(?:\.\d+)?$|^[\d,]+(?:\.\d+)?\s?[\$€£¥₹]$"),
+    "percentage": re.compile(r"^-?[\d,]+(?:\.\d+)?\s*%$")
+}
 
 
 def is_valid_date_series(series: pd.Series, col_name: str = "") -> bool:
@@ -247,9 +293,68 @@ def is_valid_date_series(series: pd.Series, col_name: str = "") -> bool:
             return False
 
 
+def detect_semantic_role(series: pd.Series, col_name: str, base_type: str) -> str:
+    """
+    Infers semantic role beyond basic dtype:
+    - 'identifier' / 'uuid' (high uniqueness IDs that should not be correlated)
+    - 'latitude' / 'longitude'
+    - 'currency' / 'percentage'
+    - 'email' / 'phone'
+    - 'general_numeric' / 'general_categorical'
+    """
+    name_lower = col_name.lower().strip()
+
+    # Coordinates
+    if name_lower in ["lat", "latitude"] and base_type == "numeric":
+        valid = series.dropna()
+        if len(valid) > 0 and valid.between(-90, 90).all():
+            return "latitude"
+    if name_lower in ["lon", "lng", "long", "longitude"] and base_type == "numeric":
+        valid = series.dropna()
+        if len(valid) > 0 and valid.between(-180, 180).all():
+            return "longitude"
+
+    # String / object checks
+    sample = series.dropna().head(30).astype(str)
+    if len(sample) > 0:
+        # UUID check
+        uuid_matches = sum(1 for s in sample if SEMANTIC_PATTERNS["uuid"].match(s.strip()))
+        if uuid_matches / len(sample) >= 0.80:
+            return "uuid"
+
+        # Email check
+        email_matches = sum(1 for s in sample if SEMANTIC_PATTERNS["email"].match(s.strip()))
+        if email_matches / len(sample) >= 0.80:
+            return "email"
+
+        # Phone check
+        phone_matches = sum(1 for s in sample if SEMANTIC_PATTERNS["phone"].match(s.strip()))
+        if phone_matches / len(sample) >= 0.80 and name_lower in ["phone", "mobile", "tel", "contact"]:
+            return "phone"
+
+        # Currency string check
+        curr_matches = sum(1 for s in sample if SEMANTIC_PATTERNS["currency"].match(s.strip()))
+        if curr_matches / len(sample) >= 0.80:
+            return "currency"
+
+        # Percentage string check
+        pct_matches = sum(1 for s in sample if SEMANTIC_PATTERNS["percentage"].match(s.strip()))
+        if pct_matches / len(sample) >= 0.80:
+            return "percentage"
+
+    # Identifier check (including numeric primary keys)
+    if NON_DATE_IDENTIFIERS.search(name_lower):
+        n_unique = series.nunique(dropna=True)
+        if len(series) > 0 and (n_unique / len(series) > 0.85):
+            return "identifier"
+
+    return f"general_{base_type}"
+
+
 def detect_schema(df: pd.DataFrame) -> Dict[str, Any]:
     """
-    Feature 3: Automatic identification of numeric, categorical, datetime, boolean types.
+    Feature 3: Automatic identification of numeric, categorical, datetime, boolean types,
+    and advanced semantic roles (identifier, uuid, currency, percentage, latitude, longitude, email, phone).
     """
     numeric_cols: List[str] = []
     categorical_cols: List[str] = []
@@ -258,40 +363,52 @@ def detect_schema(df: pd.DataFrame) -> Dict[str, Any]:
     text_cols: List[str] = []
 
     column_types: Dict[str, str] = {}
+    semantic_roles: Dict[str, str] = {}
+    analytical_numeric_cols: List[str] = []
 
     for col in df.columns:
         s = df[col]
 
         if pd.api.types.is_bool_dtype(s):
             boolean_cols.append(col)
-            column_types[col] = "boolean"
+            base_type = "boolean"
         elif pd.api.types.is_datetime64_any_dtype(s):
             datetime_cols.append(col)
-            column_types[col] = "datetime"
+            base_type = "datetime"
         elif pd.api.types.is_numeric_dtype(s):
             numeric_cols.append(col)
-            column_types[col] = "numeric"
+            base_type = "numeric"
         elif isinstance(s.dtype, pd.CategoricalDtype):
             categorical_cols.append(col)
-            column_types[col] = "categorical"
+            base_type = "categorical"
         else:
             if is_valid_date_series(s, col_name=str(col)):
                 datetime_cols.append(col)
-                column_types[col] = "datetime"
+                base_type = "datetime"
             else:
                 n_unique = s.nunique(dropna=True)
                 total_len = len(s)
                 if total_len > 0 and (n_unique / total_len < 0.15 or n_unique < 20):
                     categorical_cols.append(col)
-                    column_types[col] = "categorical"
+                    base_type = "categorical"
                 else:
                     text_cols.append(col)
-                    column_types[col] = "text"
+                    base_type = "text"
+
+        column_types[col] = base_type
+        role = detect_semantic_role(s, str(col), base_type)
+        semantic_roles[col] = role
+
+        # Analytical numerics exclude identifiers and keys
+        if base_type == "numeric" and role not in ["identifier", "uuid"]:
+            analytical_numeric_cols.append(col)
 
     return {
         "columns": list(df.columns),
         "column_types": column_types,
+        "semantic_roles": semantic_roles,
         "numeric_columns": numeric_cols,
+        "analytical_numeric_columns": analytical_numeric_cols,
         "categorical_columns": categorical_cols,
         "datetime_columns": datetime_cols,
         "boolean_columns": boolean_cols,

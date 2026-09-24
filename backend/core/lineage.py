@@ -6,8 +6,49 @@ and dataset versioning.
 
 import time
 import uuid
+import hashlib
+import sys
+import platform
 from typing import Dict, Any, List, Optional
 import pandas as pd
+import numpy as np
+
+
+def compute_dataframe_fingerprint(df: pd.DataFrame) -> str:
+    """
+    Computes a deterministic cryptographic SHA-256 fingerprint of a pandas DataFrame.
+    """
+    if df is None:
+        return "none"
+    try:
+        # Use pandas hashing function for fast, deterministic hash
+        hash_series = pd.util.hash_pandas_object(df, index=True)
+        return hashlib.sha256(hash_series.values.tobytes()).hexdigest()
+    except Exception:
+        # Fallback to serialized CSV digest
+        csv_bytes = df.to_csv(index=True).encode("utf-8")
+        return hashlib.sha256(csv_bytes).hexdigest()
+
+
+def get_provenance_metadata() -> Dict[str, str]:
+    """
+    Captures exact runtime software versions and environment provenance.
+    """
+    import scipy
+    import sklearn
+    import statsmodels
+    import plotly
+
+    return {
+        "python_version": sys.version.split()[0],
+        "platform": platform.platform(),
+        "pandas_version": pd.__version__,
+        "numpy_version": np.__version__,
+        "scipy_version": scipy.__version__,
+        "scikit_learn_version": sklearn.__version__,
+        "statsmodels_version": statsmodels.__version__,
+        "plotly_version": plotly.__version__
+    }
 
 
 class LineageRecord:
@@ -49,7 +90,7 @@ class LineageRecord:
 class DatasetSessionManager:
     """
     Manages dataset state with immutable original dataset, versioned current dataset,
-    and structured lineage audit history.
+    cryptographic SHA-256 fingerprinting, and structured lineage audit history.
     """
     def __init__(self):
         self._original_df: Optional[pd.DataFrame] = None
@@ -58,21 +99,29 @@ class DatasetSessionManager:
         self._lineage_records: List[LineageRecord] = []
         self.dataset_name: str = "Untitled Dataset"
         self.version: int = 0
+        self.fingerprint_sha256: str = ""
+        self.provenance: Dict[str, str] = get_provenance_metadata()
 
     def load_dataset(self, df: pd.DataFrame, dataset_name: str = "Dataset") -> None:
-        """Loads a new baseline dataset, resetting history and locking immutable copy."""
+        """Loads a new baseline dataset, resetting history, computing SHA-256 fingerprint, and locking immutable copy."""
         self._original_df = df.copy(deep=True)
         self._current_df = df.copy(deep=True)
         self._history = [df.copy(deep=True)]
         self._lineage_records = []
         self.dataset_name = dataset_name
         self.version = 1
+        self.fingerprint_sha256 = compute_dataframe_fingerprint(df)
+        self.provenance = get_provenance_metadata()
+
         self.record_lineage(
             operation_name="Dataset Ingestion",
-            parameters={"dataset_name": dataset_name},
+            parameters={
+                "dataset_name": dataset_name,
+                "sha256_fingerprint": self.fingerprint_sha256
+            },
             input_shape=(0, 0),
             output_shape=df.shape,
-            description=f"Ingested baseline dataset '{dataset_name}' with {len(df)} rows and {len(df.columns)} columns."
+            description=f"Ingested baseline dataset '{dataset_name}' with {len(df)} rows and {len(df.columns)} columns (SHA-256: {self.fingerprint_sha256[:12]}...)."
         )
 
     @property

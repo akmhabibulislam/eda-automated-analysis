@@ -251,8 +251,13 @@ def treat_outliers(
         q25 = series.quantile(0.25)
         q75 = series.quantile(0.75)
         iqr = q75 - q25
-        lower_bound = q25 - (threshold * iqr)
-        upper_bound = q75 + (threshold * iqr)
+        if iqr == 0.0:
+            # Handle zero-IQR bounds (e.g., highly repeated values): fall back to min/max
+            lower_bound = series.min()
+            upper_bound = series.max()
+        else:
+            lower_bound = q25 - (threshold * iqr)
+            upper_bound = q75 + (threshold * iqr)
     elif method == "zscore":
         mean = series.mean()
         std = series.std(ddof=0)

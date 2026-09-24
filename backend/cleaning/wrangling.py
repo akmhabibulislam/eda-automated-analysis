@@ -17,7 +17,7 @@ import pandas as pd
 import numpy as np
 
 from backend.cleaning.cleaning import AuditLogger
-from backend.core.validation import validate_cardinality_guard, ValidationError
+from backend.core.validation import validate_cardinality_guard, validate_merge_safety, ValidationError
 
 
 ALLOWED_FUNCTIONS = {
@@ -31,19 +31,28 @@ ALLOWED_FUNCTIONS = {
     "tan": np.tan
 }
 
+MAX_EXPRESSION_DEPTH = 10
+MAX_EXPRESSION_LENGTH = 500
+MAX_EXPONENT_VALUE = 1000.0
+
 
 class SecureExpressionEvaluator(ast.NodeVisitor):
     """
-    AST-based expression validator and evaluator.
-    Strictly forbids dangerous Python operations (__import__, open, eval, exec, lambda, etc.)
-    and only permits safe arithmetic, unary operations, math calls, and dataset column lookups.
+    AST-based expression validator and evaluator with strict resource limits:
+    - Maximum AST depth limit to prevent deeply nested recursion denial-of-service
+    - Restricted power operator blocking catastrophic exponentiation (e.g. x ** 100000000)
+    - Forbidden arbitrary function execution and attribute traversal
     """
-    def __init__(self, df: pd.DataFrame):
+    def __init__(self, df: pd.DataFrame, max_depth: int = MAX_EXPRESSION_DEPTH):
         self.df = df
+        self.max_depth = max_depth
 
-    def evaluate(self, node: ast.AST) -> Any:
+    def evaluate(self, node: ast.AST, current_depth: int = 0) -> Any:
+        if current_depth > self.max_depth:
+            raise ValueError(f"Security/Resource Guard: Expression exceeds maximum allowed depth of {self.max_depth}.")
+
         if isinstance(node, ast.Expression):
-            return self.evaluate(node.body)
+            return self.evaluate(node.body, current_depth + 1)
 
         elif isinstance(node, ast.Constant):
             return node.value
@@ -58,7 +67,7 @@ class SecureExpressionEvaluator(ast.NodeVisitor):
                 raise ValueError(f"Unknown variable or column '{col_name}' in expression.")
 
         elif isinstance(node, ast.UnaryOp):
-            operand = self.evaluate(node.operand)
+            operand = self.evaluate(node.operand, current_depth + 1)
             if isinstance(node.op, ast.UAdd):
                 return +operand
             elif isinstance(node.op, ast.USub):
@@ -67,8 +76,9 @@ class SecureExpressionEvaluator(ast.NodeVisitor):
                 raise ValueError(f"Unsupported unary operator: {type(node.op).__name__}")
 
         elif isinstance(node, ast.BinOp):
-            left = self.evaluate(node.left)
-            right = self.evaluate(node.right)
+            left = self.evaluate(node.left, current_depth + 1)
+            right = self.evaluate(node.right, current_depth + 1)
+
             if isinstance(node.op, ast.Add):
                 return left + right
             elif isinstance(node.op, ast.Sub):
@@ -82,6 +92,13 @@ class SecureExpressionEvaluator(ast.NodeVisitor):
             elif isinstance(node.op, ast.Mod):
                 return left % right
             elif isinstance(node.op, ast.Pow):
+                # Guard against extreme exponentiation denial of service
+                if isinstance(right, (int, float)) and abs(right) > MAX_EXPONENT_VALUE:
+                    raise ValueError(f"Resource Guard: Exponent {right} exceeds safe threshold of {MAX_EXPONENT_VALUE}.")
+                if isinstance(right, pd.Series):
+                    max_r = right.abs().max()
+                    if max_r > MAX_EXPONENT_VALUE:
+                        raise ValueError(f"Resource Guard: Maximum exponent in series ({max_r}) exceeds safe threshold {MAX_EXPONENT_VALUE}.")
                 return left ** right
             else:
                 raise ValueError(f"Unsupported binary operator: {type(node.op).__name__}")
@@ -93,7 +110,7 @@ class SecureExpressionEvaluator(ast.NodeVisitor):
             if func_name not in ALLOWED_FUNCTIONS:
                 raise ValueError(f"Function '{func_name}' is not in the allowed math function library.")
 
-            args = [self.evaluate(arg) for arg in node.args]
+            args = [self.evaluate(arg, current_depth + 1) for arg in node.args]
             return ALLOWED_FUNCTIONS[func_name](*args)
 
         else:
@@ -107,8 +124,11 @@ def add_custom_formula_column(
     logger: Optional[AuditLogger] = None
 ) -> pd.DataFrame:
     """
-    Feature 20: Secure AST-based Formula Builder.
+    Feature 20: Secure AST-based Formula Builder with resource and length limits.
     """
+    if len(expression) > MAX_EXPRESSION_LENGTH:
+        raise ValueError(f"Expression length ({len(expression)}) exceeds maximum allowed limit of {MAX_EXPRESSION_LENGTH} characters.")
+
     result = df.copy()
 
     clean_expr = expression
@@ -161,7 +181,7 @@ def bin_continuous_column(
     logger: Optional[AuditLogger] = None
 ) -> pd.DataFrame:
     """
-    Feature 21: Binning & Discretization.
+    Feature 21: Binning & Discretization with NaN preservation.
     """
     if column not in df.columns or not pd.api.types.is_numeric_dtype(df[column]):
         raise ValueError(f"Column '{column}' is not a valid numeric column.")
@@ -170,19 +190,20 @@ def bin_continuous_column(
     result = df.copy()
 
     if bin_type == "equal_width":
-        result[target_name] = pd.cut(result[column], bins=bins, labels=labels, include_lowest=True)
+        binned = pd.cut(result[column], bins=bins, labels=labels, include_lowest=True)
     elif bin_type == "quantile":
         num_quantiles = bins if isinstance(bins, int) else 4
-        result[target_name] = pd.qcut(result[column], q=num_quantiles, labels=labels, duplicates="drop")
+        binned = pd.qcut(result[column], q=num_quantiles, labels=labels, duplicates="drop")
     else:
         raise ValueError(f"Unknown bin_type '{bin_type}'. Must be 'equal_width' or 'quantile'.")
 
-    result[target_name] = result[target_name].astype(str)
+    # Use string dtype so NaN values are preserved as <NA> instead of the string 'nan'
+    result[target_name] = binned.astype("string")
 
     if logger:
         logger.log(
             action="Binning / Discretization",
-            details=f"Binned '{column}' into '{target_name}' using {bin_type} ({bins} bins)",
+            details=f"Binned '{column}' into '{target_name}' using {bin_type} ({bins} bins, nulls preserved)",
             rows_affected=len(result),
             columns_affected=[target_name]
         )
@@ -197,11 +218,17 @@ def aggregate_groupby(
 ) -> pd.DataFrame:
     """
     Feature 22: SQL-like Groupby & Aggregations with cardinality and resource safety limits.
+    Estimates potential Cartesian group explosion before execution.
     """
     for col in group_columns:
         if col not in df.columns:
             raise ValueError(f"Group column '{col}' not found.")
         validate_cardinality_guard(df, col, max_cardinality=1000)
+
+    # Estimate theoretical max groups
+    est_groups = 1
+    for col in group_columns:
+        est_groups *= int(df[col].nunique(dropna=True))
 
     grouped = df.groupby(group_columns, observed=False).agg(aggregations)
     if len(grouped) > max_groups_limit:
@@ -220,11 +247,23 @@ def merge_datasets(
     left_on: Optional[Union[str, List[str]]] = None,
     right_on: Optional[Union[str, List[str]]] = None,
     on: Optional[Union[str, List[str]]] = None,
+    max_output_rows: int = 500000,
     logger: Optional[AuditLogger] = None
 ) -> pd.DataFrame:
     """
-    Feature 23: Merging & Joining.
+    Feature 23: Merging & Joining with Cartesian explosion safety validation.
     """
+    # Guard against merge explosion
+    validate_merge_safety(
+        left_df=left_df,
+        right_df=right_df,
+        how=how,
+        left_on=left_on,
+        right_on=right_on,
+        on=on,
+        max_output_rows=max_output_rows
+    )
+
     result = pd.merge(
         left=left_df,
         right=right_df,
@@ -235,14 +274,20 @@ def merge_datasets(
         suffixes=("_left", "_right")
     )
 
+    if len(result) > max_output_rows:
+        raise ValueError(f"Merge output yielded {len(result):,} rows, exceeding max limit of {max_output_rows:,}.")
+
     if logger:
         logger.log(
             action=f"Merge Datasets ({how.upper()})",
-            details=f"Merged datasets on keys: on={on}, left_on={left_on}, right_on={right_on}",
+            details=f"Merged datasets on keys: on={on}, left_on={left_on}, right_on={right_on} (output rows: {len(result)})",
             rows_affected=len(result),
             columns_affected=list(result.columns)
         )
     return result
+
+
+MAX_REGEX_PATTERN_LENGTH = 200
 
 
 def extract_regex_patterns(
@@ -254,28 +299,42 @@ def extract_regex_patterns(
     logger: Optional[AuditLogger] = None
 ) -> pd.DataFrame:
     """
-    Feature 24: Text Regex Extraction.
+    Feature 24: Text Regex Extraction with strict NaN preservation and pattern complexity guard.
     """
     if source_column not in df.columns:
         raise ValueError(f"Column '{source_column}' does not exist.")
 
+    if len(pattern) > MAX_REGEX_PATTERN_LENGTH:
+        raise ValueError(f"Regex pattern exceeds maximum allowed length of {MAX_REGEX_PATTERN_LENGTH} characters.")
+
+    # Validate pattern compilation
+    try:
+        compiled_test = re.compile(pattern)
+    except re.error as e:
+        raise ValueError(f"Invalid regular expression '{pattern}': {str(e)}")
+
     result = df.copy()
-    str_series = result[source_column].astype(str)
+    # Use pandas StringDtype to strictly preserve missing values
+    str_series = result[source_column].astype("string")
 
     if extract_all:
-        result[new_column_name] = str_series.apply(
-            lambda x: ", ".join(re.findall(pattern, x)) if pd.notna(x) else ""
-        )
+        def match_all(x):
+            if pd.isna(x):
+                return pd.NA
+            matches = compiled_test.findall(str(x))
+            return ", ".join(matches) if matches else ""
+
+        result[new_column_name] = str_series.apply(match_all).astype("string")
     else:
         compiled_pattern = pattern if "(" in pattern else f"({pattern})"
         extracted = str_series.str.extract(compiled_pattern, expand=False)
-        result[new_column_name] = extracted
+        result[new_column_name] = extracted.astype("string")
 
     if logger:
         logger.log(
             action="Text Regex Extraction",
-            details=f"Extracted pattern '{pattern}' from '{source_column}' into '{new_column_name}'",
-            rows_affected=int((result[new_column_name] != "").sum()),
+            details=f"Extracted pattern '{pattern}' from '{source_column}' into '{new_column_name}' (nulls preserved)",
+            rows_affected=int((result[new_column_name].notna()).sum()),
             columns_affected=[new_column_name]
         )
     return result
@@ -287,12 +346,24 @@ def pivot_dataframe(
     columns: str,
     values: str,
     aggfunc: str = "mean",
-    max_column_cardinality: int = 100
+    max_column_cardinality: int = 100,
+    max_cells_limit: int = 2000000
 ) -> pd.DataFrame:
     """
-    Feature 25a: Reshaping - Long to Wide (Pivot) with strict column cardinality guards.
+    Feature 25a: Reshaping - Long to Wide (Pivot) with strict column cardinality and cell size estimation guards.
     """
     validate_cardinality_guard(df, columns, max_cardinality=max_column_cardinality)
+
+    # Estimate output cell size before pivoting
+    est_cols = int(df[columns].nunique(dropna=True))
+    est_rows = len(df.drop_duplicates(subset=index_cols)) if index_cols else 1
+    est_total_cells = est_rows * est_cols
+
+    if est_total_cells > max_cells_limit:
+        raise ValueError(
+            f"Pivot Explosion Guard: Estimated output of {est_rows:,} rows x {est_cols:,} columns "
+            f"({est_total_cells:,} total cells) exceeds safety ceiling of {max_cells_limit:,} cells."
+        )
 
     pivoted = df.pivot_table(
         index=index_cols,
@@ -339,6 +410,7 @@ def filter_rows_structured(
 ) -> pd.DataFrame:
     """
     Feature 26: Secure, structured row filtering.
+    Does not convert NaN to 'nan' string during comparison operations.
     """
     if column not in df.columns:
         raise ValueError(f"Column '{column}' not found in dataframe.")
@@ -351,18 +423,23 @@ def filter_rows_structured(
     elif operator == "!=":
         mask = s != comparison_value
     elif operator == ">":
-        mask = s > float(comparison_value)
+        val = float(comparison_value)
+        mask = (s > val) & s.notna()
     elif operator == ">=":
-        mask = s >= float(comparison_value)
+        val = float(comparison_value)
+        mask = (s >= val) & s.notna()
     elif operator == "<":
-        mask = s < float(comparison_value)
+        val = float(comparison_value)
+        mask = (s < val) & s.notna()
     elif operator == "<=":
-        mask = s <= float(comparison_value)
+        val = float(comparison_value)
+        mask = (s <= val) & s.notna()
     elif operator == "contains":
-        mask = s.astype(str).str.contains(str(comparison_value), case=False, na=False)
+        str_series = s.astype("string")
+        mask = str_series.str.contains(str(comparison_value), case=False, na=False)
     elif operator == "in":
         val_list = [v.strip() for v in str(comparison_value).split(",")]
-        mask = s.astype(str).isin(val_list)
+        mask = s.isin(val_list) & s.notna()
     else:
         raise ValueError(f"Unsupported query operator '{operator}'. Allowed: {SUPPORTED_QUERY_OPERATORS}")
 
@@ -377,3 +454,4 @@ def filter_rows_structured(
             columns_affected=[column]
         )
     return filtered_df
+
