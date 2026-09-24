@@ -12,38 +12,35 @@ The platform is organized into six functional analytical workspaces:
 
 1. **Ingestion, Schema & Memory Profiling (Features 1–5 + Memory Layer)**
    - Strict file format detection (.csv, .tsv, .xlsx, .xls, .json, .parquet) rejecting ambiguous extensions (.txt, .xyz).
-   - Safe relational database connector (SQLite, PostgreSQL, MySQL) enforcing read-only SELECT queries with connection timeouts and row ceilings.
-   - Robust schema detection distinguishing between genuine dates and alphanumeric identifiers, UUIDs, or SKUs containing hyphens.
-   - Precision-safe memory management: safe integer downcasting (`int64` to `int32`/`int16`/`int8`) with float downcasting strictly opt-in to avoid precision loss in financial and scientific applications.
-   - Real-time RAM utilization tracking and explicit garbage collection (`gc.collect()`).
+   - Multi-layered database security: multi-statement blocking, keyword blacklist, statement timeouts, and database-side LIMIT injection.
+   - Semantic schema inference identifying roles (identifier, uuid, currency, percentage, latitude, longitude, email, phone) to exclude identifiers from numerical statistics.
+   - Precision-safe memory downcasting with Pandas nullable integer types (`Int8` through `Int64`) preventing NaN crash conditions.
+   - Cryptographic SHA-256 dataset fingerprinting and software environment provenance tracking (Python, Pandas, NumPy, Scikit-Learn).
 
 2. **Data Quality, Recommendations & Controlled Clean (Features 6–13)**
    - Interactive recommendation analysis identifying missing columns, duplicate rows, and outlier candidates without blind mutations.
-   - Controlled cleaning pipeline where imputation and outlier capping (`threshold=3.0`) are opt-in.
+   - Controlled cleaning pipeline where imputation and outlier capping (`threshold=3.0`) are strictly opt-in.
+   - Zero-IQR protection in outlier detection preventing truncation on repeated values.
    - Strict null preservation in text cleaning, ensuring missing values are not converted into string `'nan'`.
-   - Robust boolean parser converting `'true'`, `'yes'`, `'1'` vs `'false'`, `'no'`, `'0'` safely without `astype(bool)` flaws.
-   - Chronological audit lineage logging tracking all transformation events.
+   - Chronological audit lineage logging tracking all transformation events with operation IDs.
 
 3. **Advanced Data Wrangling & Reshaping (Features 20–26)**
-   - Secure Abstract Syntax Tree (AST) formula evaluation engine (`revenue - cost` or `sqrt(units_sold) * 10`) blocking code injection attempts (`__import__`, `open`, `eval`, `exec`).
-   - Continuous binning & discretization (equal-width and quantile).
-   - SQL-like groupby and multi-aggregations (`mean`, `sum`, `std`, `median`).
+   - Secure Abstract Syntax Tree (AST) formula builder with strict depth limits, input length caps, and exponentiation ceilings (blocking catastrophic exponentiation).
+   - Text regex extraction and continuous binning with native string dtypes strictly preserving null values.
+   - Cartesian explosion guard on merges and cell size estimation limits on pivots to prevent memory crashes.
    - Structured parametric row query filtering replacing unrestricted expression evaluation.
-   - Text regex pattern extraction and dataset pivoting/unpivoting (melt).
 
 4. **Statistics & Hypothesis Testing (Features 14–19, 27–31)**
-   - Univariate descriptive statistics, distribution skewness, and kurtosis.
-   - Correlation matrices (Pearson, Spearman, Kendall).
-   - Pairwise correlation warnings (features with $r \ge 0.80$) and Variance Inflation Factor (VIF) multicollinearity diagnostics.
-   - Independent T-Tests and index-aligned paired T-Tests dropping missing pairs symmetrically.
-   - One-Way ANOVA and Pearson's Chi-Square Test of Independence with expected frequency tables.
-   - Non-parametric Mann-Whitney U and Kruskal-Wallis tests.
-   - Kolmogorov-Smirnov distribution fitting (Normal, Exponential, Uniform, Log-Normal) with explicit parameter disclosure.
+   - Transparent correlation matrices reporting pairwise sample coverage ($N$ used).
+   - Multicollinearity diagnostics (VIF) and correlation calculations protected with feature bounds and constant-column elimination.
+   - Configurable significance thresholds ($\alpha = 0.10, 0.05, 0.01$).
+   - Effect sizes (Cohen's d, Eta-squared, Cramer's V), confidence intervals, and post-hoc Tukey HSD testing.
+   - Multiple testing corrections: Bonferroni and Benjamini-Hochberg (FDR).
 
 5. **Time-Series Analysis & Mathematical Modeling (Features 32–41)**
    - Temporal resampling and moving window metrics strictly sorted by datetime.
-   - Period-over-period growth (MoM/YoY) and cumulative sums.
-   - Seasonal-trend decomposition strictly enforcing observation requirements ($N \ge 2 \times \text{period}$) without silent period alterations.
+   - Period-over-period growth with calendar frequency validation and row-order preservation.
+   - Seasonal-trend decomposition strictly enforcing observation requirements ($N \ge 2 \times \text{period}$).
    - Non-linear curve fitting with trendline equation derivation ($y = mx + b$, quadratic, exponential, logarithmic, power law).
    - Parametric function-family search powered by bounded genetic optimization across multiple functional families.
    - K-Means clustering with cluster centers inverse-transformed back to original feature scale.
@@ -54,7 +51,7 @@ The platform is organized into six functional analytical workspaces:
    - Plotly interactive auto-plotting, distribution histograms, relationship charts, and custom multi-axis chart builders.
    - Cleaned dataset exports (CSV, Excel, Parquet).
    - Automated Executive Summary narrative generated via deterministic analytical rules.
-   - Standalone interactive HTML report generation.
+   - Standalone interactive HTML report generation embedding cryptographic dataset fingerprints and software provenance.
    - Printable multi-page PDF report generation with dynamic ReportLab table cell wrapping to prevent margin overflow.
 
 ---

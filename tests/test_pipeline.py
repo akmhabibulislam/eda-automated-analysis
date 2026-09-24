@@ -41,13 +41,23 @@ from backend.core.validation import (
     validate_numeric_finite_column,
     validate_non_zero_variance,
     validate_cardinality_guard,
+    validate_merge_safety,
+    sanitize_and_report_numeric_policy,
     ValidationError
 )
-from backend.core.lineage import DatasetSessionManager, LineageRecord
+from backend.core.lineage import (
+    DatasetSessionManager,
+    LineageRecord,
+    compute_dataframe_fingerprint,
+    get_provenance_metadata
+)
 from backend.cleaning.wrangling import (
     add_custom_formula_column,
     bin_continuous_column,
-    filter_rows_structured
+    filter_rows_structured,
+    extract_regex_patterns,
+    merge_datasets,
+    pivot_dataframe
 )
 from backend.analysis.statistics import (
     compute_univariate_summary,
@@ -423,6 +433,78 @@ class TestDataSightCorrectness(unittest.TestCase):
 
         lineage_df = manager.get_lineage_dataframe()
         self.assertEqual(len(lineage_df), 3)  # Ingestion, Filter, Reset
+
+    # -------------------------------------------------------------
+    # 8. Hardening Guardrails, Semantic Schema & Reproducibility
+    # -------------------------------------------------------------
+
+    def test_regex_extraction_preserves_nan(self):
+        df = pd.DataFrame({"emails": ["contact@test.com", np.nan, "hello@world.org"]})
+        extracted = extract_regex_patterns(df, "emails", r"[\w\.-]+@([\w\.-]+)", "domain")
+        self.assertEqual(extracted["domain"].iloc[0], "test.com")
+        self.assertTrue(pd.isna(extracted["domain"].iloc[1]))
+        self.assertEqual(extracted["domain"].iloc[2], "world.org")
+
+    def test_binning_preserves_nan_without_stringification(self):
+        df = pd.DataFrame({"scores": [10.0, 50.0, np.nan, 90.0]})
+        binned = bin_continuous_column(df, "scores", bins=3)
+        self.assertTrue(pd.isna(binned["scores_binned"].iloc[2]))
+        # Must not be the string 'nan'
+        self.assertNotEqual(str(binned["scores_binned"].iloc[2]), "nan")
+
+    def test_merge_cartesian_explosion_guard(self):
+        # Create data with massive duplicate key potential
+        df1 = pd.DataFrame({"key": ["dup"] * 1000, "val1": range(1000)})
+        df2 = pd.DataFrame({"key": ["dup"] * 1000, "val2": range(1000)})
+        # Merging would create 1,000,000 rows
+        with self.assertRaises(ValidationError):
+            merge_datasets(df1, df2, on="key", max_output_rows=50000)
+
+    def test_ast_formula_blocks_excessive_exponentiation(self):
+        df = pd.DataFrame({"x": [2.0, 3.0, 4.0]})
+        with self.assertRaises(ValueError):
+            add_custom_formula_column(df, "blown_up", "x ** 100000000")
+
+    def test_semantic_role_detection(self):
+        from backend.ingestion.loaders import detect_schema
+        df = pd.DataFrame({
+            "user_id": [f"ID_{i}" for i in range(100)],
+            "email_address": [f"user{i}@example.com" for i in range(100)],
+            "latitude": np.random.uniform(20.0, 50.0, size=100),
+            "revenue": np.random.uniform(100.0, 1000.0, size=100)
+        })
+        schema = detect_schema(df)
+        self.assertEqual(schema["semantic_roles"]["user_id"], "identifier")
+        self.assertEqual(schema["semantic_roles"]["email_address"], "email")
+        self.assertEqual(schema["semantic_roles"]["latitude"], "latitude")
+        # Ensure user_id was excluded from analytical numerics
+        self.assertNotIn("user_id", schema["analytical_numeric_columns"])
+
+    def test_cryptographic_dataset_fingerprint(self):
+        df1 = pd.DataFrame({"a": [1, 2, 3], "b": [4, 5, 6]})
+        df2 = pd.DataFrame({"a": [1, 2, 3], "b": [4, 5, 6]})
+        df3 = pd.DataFrame({"a": [1, 2, 3], "b": [4, 5, 999]})
+
+        fp1 = compute_dataframe_fingerprint(df1)
+        fp2 = compute_dataframe_fingerprint(df2)
+        fp3 = compute_dataframe_fingerprint(df3)
+
+        self.assertEqual(fp1, fp2)
+        self.assertNotEqual(fp1, fp3)
+        self.assertEqual(len(fp1), 64)  # SHA-256 hex length
+
+    def test_software_provenance_metadata(self):
+        prov = get_provenance_metadata()
+        self.assertIn("python_version", prov)
+        self.assertIn("pandas_version", prov)
+        self.assertIn("numpy_version", prov)
+        self.assertIn("scikit_learn_version", prov)
+
+    def test_treat_outliers_zero_iqr(self):
+        # Dataset where Q25 == Q75 (e.g. constant or dominant values)
+        df_zero_iqr = pd.DataFrame({"val": [10.0, 10.0, 10.0, 10.0, 10.0, 100.0]})
+        treated, meta = treat_outliers(df_zero_iqr, "val", method="iqr")
+        self.assertEqual(meta["outliers_detected"], 0)
 
 
 if __name__ == "__main__":
