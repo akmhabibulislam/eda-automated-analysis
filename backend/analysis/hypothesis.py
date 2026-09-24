@@ -1,44 +1,55 @@
 """
 Statistical Testing & Hypothesis Validation module.
 Features 27-31:
-27. T-Tests (independent and paired)
+27. T-Tests (independent with Welch/Student options and index-aligned Paired tests)
 28. ANOVA (Analysis of Variance)
 29. Chi-Square Test of Independence
 30. Mann-Whitney U / Kruskal-Wallis Non-Parametric Tests
-31. Distribution Fitting (Normal, Poisson, Exponential, Uniform evaluation)
+31. Distribution Fitting (Kolmogorov-Smirnov evaluation with transparent parameter disclosure)
 """
 
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Union
 import pandas as pd
 import numpy as np
 from scipy import stats
 
 
 def run_t_test(
-    sample_a: np.ndarray,
-    sample_b: np.ndarray,
+    sample_a: Union[np.ndarray, pd.Series],
+    sample_b: Union[np.ndarray, pd.Series],
     test_type: str = "independent",
     equal_var: bool = False
 ) -> Dict[str, Any]:
     """
     Feature 27: Independent and Paired T-Tests.
+    For paired tests, index-aligns observations and drops missing pairs simultaneously
+    to ensure pairwise integrity.
     """
-    clean_a = sample_a[~np.isnan(sample_a)]
-    clean_b = sample_b[~np.isnan(sample_b)]
+    if test_type == "paired":
+        # Ensure series structure for index alignment
+        s_a = pd.Series(sample_a)
+        s_b = pd.Series(sample_b)
+        paired_df = pd.DataFrame({"a": s_a, "b": s_b}).dropna()
 
-    if len(clean_a) < 2 or len(clean_b) < 2:
-        raise ValueError("Each sample must have at least 2 non-null observations.")
+        clean_a = paired_df["a"].values.astype(float)
+        clean_b = paired_df["b"].values.astype(float)
 
-    if test_type == "independent":
-        stat, p_val = stats.ttest_ind(clean_a, clean_b, equal_var=equal_var)
-        test_name = "Welch's T-Test" if not equal_var else "Student's Independent T-Test"
-    elif test_type == "paired":
-        if len(clean_a) != len(clean_b):
-            min_len = min(len(clean_a), len(clean_b))
-            clean_a = clean_a[:min_len]
-            clean_b = clean_b[:min_len]
+        if len(clean_a) < 2:
+            raise ValueError("Paired T-Test requires at least 2 complete, non-null paired observations.")
+
         stat, p_val = stats.ttest_rel(clean_a, clean_b)
-        test_name = "Paired Sample T-Test"
+        test_name = "Paired Student's T-Test"
+
+    elif test_type == "independent":
+        clean_a = np.asarray(sample_a)[~pd.isna(sample_a)].astype(float)
+        clean_b = np.asarray(sample_b)[~pd.isna(sample_b)].astype(float)
+
+        if len(clean_a) < 2 or len(clean_b) < 2:
+            raise ValueError("Each sample must have at least 2 non-null observations.")
+
+        stat, p_val = stats.ttest_ind(clean_a, clean_b, equal_var=equal_var)
+        test_name = "Welch's T-Test (Unequal Variance)" if not equal_var else "Student's T-Test (Equal Variance)"
+
     else:
         raise ValueError("test_type must be either 'independent' or 'paired'")
 
@@ -52,10 +63,12 @@ def run_t_test(
         "p_value_formatted": f"{p_val:.4e}" if p_val < 0.0001 else f"{p_val:.4f}",
         "alpha": alpha,
         "is_significant": significant,
+        "n_obs_a": len(clean_a),
+        "n_obs_b": len(clean_b),
         "mean_sample_a": round(float(np.mean(clean_a)), 4),
         "mean_sample_b": round(float(np.mean(clean_b)), 4),
         "conclusion": (
-            "Reject null hypothesis: Significant difference between groups (p < 0.05)."
+            "Reject null hypothesis: Significant difference detected between groups (p < 0.05)."
             if significant
             else "Fail to reject null hypothesis: No statistically significant difference detected (p >= 0.05)."
         )
@@ -66,7 +79,9 @@ def run_anova(groups: List[np.ndarray], group_names: Optional[List[str]] = None)
     """
     Feature 28: One-Way ANOVA (Analysis of Variance).
     """
-    clean_groups = [g[~np.isnan(g)] for g in groups if len(g[~np.isnan(g)]) >= 2]
+    clean_groups = [np.asarray(g)[~pd.isna(g)].astype(float) for g in groups]
+    clean_groups = [g for g in clean_groups if len(g) >= 2]
+
     if len(clean_groups) < 2:
         raise ValueError("ANOVA requires at least 2 groups with >= 2 observations each.")
 
@@ -134,7 +149,9 @@ def run_non_parametric_tests(
     """
     Feature 30: Mann-Whitney U (2 groups) or Kruskal-Wallis (> 2 groups) Non-Parametric Tests.
     """
-    clean_groups = [g[~np.isnan(g)] for g in groups if len(g[~np.isnan(g)]) >= 2]
+    clean_groups = [np.asarray(g)[~pd.isna(g)].astype(float) for g in groups]
+    clean_groups = [g for g in clean_groups if len(g) >= 2]
+
     if len(clean_groups) < 2:
         raise ValueError("Non-parametric test requires at least 2 valid groups.")
 
@@ -176,10 +193,11 @@ def run_non_parametric_tests(
 
 def fit_distributions(data: np.ndarray) -> pd.DataFrame:
     """
-    Feature 31: Distribution Fitting (Normal, Exponential, Uniform, Log-Normal).
-    Computes Kolmogorov-Smirnov test statistics and p-values using explicit CDF instances.
+    Feature 31: Distribution Fitting via Kolmogorov-Smirnov Tests.
+    Clearly discloses fitted sample parameters and presents statistically accurate conclusions.
+    (Note: p-values are conservative due to sample parameter estimation).
     """
-    clean_data = data[~np.isnan(data)]
+    clean_data = np.asarray(data)[~pd.isna(data)].astype(float)
     if len(clean_data) < 10:
         raise ValueError("Distribution fitting requires at least 10 observations.")
 
@@ -187,56 +205,67 @@ def fit_distributions(data: np.ndarray) -> pd.DataFrame:
 
     # 1. Normal Distribution
     norm_params = stats.norm.fit(clean_data)
-    norm_cdf = stats.norm(*norm_params).cdf
-    ks_stat, ks_pval = stats.kstest(clean_data, norm_cdf)
+    norm_dist = stats.norm(*norm_params)
+    ks_stat, ks_pval = stats.kstest(clean_data, norm_dist.cdf)
     results.append({
         "Distribution": "Normal (Gaussian)",
         "KS_Statistic": round(float(ks_stat), 4),
         "P_Value": round(float(ks_pval), 4),
-        "Fitted_Parameters": f"μ={norm_params[0]:.2f}, σ={norm_params[1]:.2f}",
-        "Fit_Quality": "Good" if ks_pval > 0.05 else "Poor"
+        "Fitted_Parameters": f"Mean={norm_params[0]:.2f}, Std={norm_params[1]:.2f}",
+        "Statistical_Assessment": (
+            "No strong evidence against this distribution under this test"
+            if ks_pval > 0.05 else "Significant deviation from hypothesized distribution"
+        )
     })
 
     # 2. Exponential Distribution (non-negative data)
     if (clean_data >= 0).all():
         exp_params = stats.expon.fit(clean_data)
-        exp_cdf = stats.expon(*exp_params).cdf
-        ks_stat, ks_pval = stats.kstest(clean_data, exp_cdf)
+        exp_dist = stats.expon(*exp_params)
+        ks_stat, ks_pval = stats.kstest(clean_data, exp_dist.cdf)
         results.append({
             "Distribution": "Exponential",
             "KS_Statistic": round(float(ks_stat), 4),
             "P_Value": round(float(ks_pval), 4),
-            "Fitted_Parameters": f"loc={exp_params[0]:.2f}, scale={exp_params[1]:.2f}",
-            "Fit_Quality": "Good" if ks_pval > 0.05 else "Poor"
+            "Fitted_Parameters": f"Loc={exp_params[0]:.2f}, Scale={exp_params[1]:.2f}",
+            "Statistical_Assessment": (
+                "No strong evidence against this distribution under this test"
+                if ks_pval > 0.05 else "Significant deviation from hypothesized distribution"
+            )
         })
 
     # 3. Uniform Distribution
     uni_params = stats.uniform.fit(clean_data)
-    uni_cdf = stats.uniform(*uni_params).cdf
-    ks_stat, ks_pval = stats.kstest(clean_data, uni_cdf)
+    uni_dist = stats.uniform(*uni_params)
+    ks_stat, ks_pval = stats.kstest(clean_data, uni_dist.cdf)
     results.append({
         "Distribution": "Uniform",
         "KS_Statistic": round(float(ks_stat), 4),
         "P_Value": round(float(ks_pval), 4),
-        "Fitted_Parameters": f"min={uni_params[0]:.2f}, width={uni_params[1]:.2f}",
-        "Fit_Quality": "Good" if ks_pval > 0.05 else "Poor"
+        "Fitted_Parameters": f"Min={uni_params[0]:.2f}, Width={uni_params[1]:.2f}",
+        "Statistical_Assessment": (
+            "No strong evidence against this distribution under this test"
+            if ks_pval > 0.05 else "Significant deviation from hypothesized distribution"
+        )
     })
 
-    # 4. Log-Normal Distribution (strictly positive)
+    # 4. Log-Normal Distribution
     if (clean_data > 0).all():
         try:
             lognorm_params = stats.lognorm.fit(clean_data)
-            lognorm_cdf = stats.lognorm(*lognorm_params).cdf
-            ks_stat, ks_pval = stats.kstest(clean_data, lognorm_cdf)
+            lognorm_dist = stats.lognorm(*lognorm_params)
+            ks_stat, ks_pval = stats.kstest(clean_data, lognorm_dist.cdf)
             results.append({
                 "Distribution": "Log-Normal",
                 "KS_Statistic": round(float(ks_stat), 4),
                 "P_Value": round(float(ks_pval), 4),
-                "Fitted_Parameters": f"s={lognorm_params[0]:.2f}, scale={lognorm_params[2]:.2f}",
-                "Fit_Quality": "Good" if ks_pval > 0.05 else "Poor"
+                "Fitted_Parameters": f"Shape={lognorm_params[0]:.2f}, Scale={lognorm_params[2]:.2f}",
+                "Statistical_Assessment": (
+                    "No strong evidence against this distribution under this test"
+                    if ks_pval > 0.05 else "Significant deviation from hypothesized distribution"
+                )
             })
         except Exception:
             pass
 
-    res_df = pd.DataFrame(results)
-    return res_df.sort_values(by="KS_Statistic").reset_index(drop=True)
+    return pd.DataFrame(results).sort_values(by="KS_Statistic").reset_index(drop=True)

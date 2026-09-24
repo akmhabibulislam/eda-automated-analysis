@@ -2,9 +2,9 @@
 Mathematical Modeling, Equations & Unsupervised Clustering module.
 Features 37-41:
 37. Curve Fitting & Trendline Equations (computing and displaying mathematical formulas like y = mx + b)
-38. High-Performance Vectorized Symbolic Regression
-39. K-Means Clustering (grouping data points by feature similarity)
-40. Dimensionality Reduction (PCA for 2D/3D visualization)
+38. Parametric Function-Family Search (formerly Symbolic Regression) with strict resource bounds
+39. K-Means Clustering (with inverse-transformed cluster centers)
+40. Dimensionality Reduction (PCA with feature loadings, contributions & explained variance)
 41. Anomaly/Outlier Scoring (Isolation Forest scoring)
 """
 
@@ -115,7 +115,7 @@ def fit_curve_and_equation(
 
 
 # -------------------------------------------------------------
-# Feature 38: Vectorized High-Speed Symbolic Regression
+# Feature 38: Parametric Function-Family Search (Vectorized Genetic Algorithm)
 # -------------------------------------------------------------
 
 def run_symbolic_regression(
@@ -127,8 +127,10 @@ def run_symbolic_regression(
     subsample_size: int = 1000
 ) -> Dict[str, Any]:
     """
-    Discovers mathematical equations from data using a vectorized genetic programming search.
-    Subsamples large datasets to prevent UI freezes while ensuring rapid convergence.
+    Feature 38: Parametric Function-Family Search (formerly Symbolic Regression).
+    Discovers mathematical equations across diverse non-linear function families
+    (polynomial, sinusoidal, exponential, rational, logarithmic) using vectorized
+    genetic optimization with strict population and generation limits.
     """
     sub = df[[x_col, y_col]].dropna()
     if len(sub) > subsample_size:
@@ -138,17 +140,16 @@ def run_symbolic_regression(
     y = sub[y_col].values.astype(float)
 
     if len(x) < 5:
-        raise ValueError("Symbolic regression requires at least 5 data points.")
+        raise ValueError("Parametric function search requires at least 5 data points.")
 
-    # Candidate functional basis library
     basis_functions = [
-        ("linear", lambda x, c: c[0] * x + c[1], "c0*x + c1", 2),
-        ("quadratic", lambda x, c: c[0] * (x**2) + c[1] * x + c[2], "c0*x^2 + c1*x + c2", 3),
-        ("cubic", lambda x, c: c[0] * (x**3) + c[1] * (x**2) + c[2] * x + c[3], "c0*x^3 + c1*x^2 + c2*x + c3", 4),
-        ("sinusoidal", lambda x, c: c[0] * np.sin(c[1] * x) + c[2], "c0*sin(c1*x) + c2", 3),
-        ("exponential", lambda x, c: c[0] * np.exp(np.clip(c[1] * x, -15, 15)) + c[2], "c0*exp(c1*x) + c2", 3),
-        ("rational", lambda x, c: (c[0] * x) / (np.abs(x) + c[1] + 1e-6) + c[2], "(c0*x)/(|x|+c1) + c2", 3),
-        ("logarithmic", lambda x, c: c[0] * np.log(np.maximum(np.abs(x), 1e-5)) + c[1], "c0*ln(|x|) + c1", 2)
+        ("Linear Family", lambda x, c: c[0] * x + c[1], "c0*x + c1", 2),
+        ("Quadratic Family", lambda x, c: c[0] * (x**2) + c[1] * x + c[2], "c0*x^2 + c1*x + c2", 3),
+        ("Cubic Family", lambda x, c: c[0] * (x**3) + c[1] * (x**2) + c[2] * x + c[3], "c0*x^3 + c1*x^2 + c2*x + c3", 4),
+        ("Sinusoidal Family", lambda x, c: c[0] * np.sin(c[1] * x) + c[2], "c0*sin(c1*x) + c2", 3),
+        ("Exponential Family", lambda x, c: c[0] * np.exp(np.clip(c[1] * x, -15, 15)) + c[2], "c0*exp(c1*x) + c2", 3),
+        ("Rational Family", lambda x, c: (c[0] * x) / (np.abs(x) + c[1] + 1e-6) + c[2], "(c0*x)/(|x|+c1) + c2", 3),
+        ("Logarithmic Family", lambda x, c: c[0] * np.log(np.maximum(np.abs(x), 1e-5)) + c[1], "c0*ln(|x|) + c1", 2)
     ]
 
     best_fit = None
@@ -157,11 +158,14 @@ def run_symbolic_regression(
     best_name = ""
     best_template = ""
 
-    # Genetic parameter search across functional structures
-    for name, func, template, n_coeffs in basis_functions:
-        pop = [np.random.uniform(-5.0, 5.0, size=n_coeffs) for _ in range(population_size)]
+    # Bound computational complexity
+    gen_bounded = min(generations, 30)
+    pop_bounded = min(population_size, 60)
 
-        for _ in range(generations):
+    for name, func, template, n_coeffs in basis_functions:
+        pop = [np.random.uniform(-5.0, 5.0, size=n_coeffs) for _ in range(pop_bounded)]
+
+        for _ in range(gen_bounded):
             scores = []
             for indiv in pop:
                 try:
@@ -182,12 +186,11 @@ def run_symbolic_regression(
                 best_name = name
                 best_template = template
 
-            # Elitism and vectorized Gaussian mutation
-            survivors = [s[1] for s in scores[: max(2, population_size // 4)]]
+            survivors = [s[1] for s in scores[: max(2, pop_bounded // 4)]]
             new_pop = list(survivors)
-            while len(new_pop) < population_size:
+            while len(new_pop) < pop_bounded:
                 parent = random.choice(survivors)
-                mutant = parent + np.random.normal(0, 0.25, size=n_coeffs)
+                mutant = parent + np.random.normal(0, 0.20, size=n_coeffs)
                 new_pop.append(mutant)
             pop = new_pop
 
@@ -196,7 +199,6 @@ def run_symbolic_regression(
     ss_tot = np.sum((y - np.mean(y)) ** 2)
     r_squared = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
 
-    # Build readable equation with discovered coefficients
     clean_eq = best_template
     for idx, c in enumerate(best_coeffs):
         clean_eq = clean_eq.replace(f"c{idx}", f"{c:.3f}")
@@ -206,7 +208,7 @@ def run_symbolic_regression(
         "basis_family": best_name,
         "mse": round(float(best_fitness), 4),
         "r_squared": round(float(r_squared), 4),
-        "generations_run": generations,
+        "generations_run": gen_bounded,
         "x": x,
         "y": y,
         "y_pred": y_pred
@@ -214,7 +216,7 @@ def run_symbolic_regression(
 
 
 # -------------------------------------------------------------
-# Feature 39: K-Means Clustering
+# Feature 39: K-Means Clustering (Inverse-Transformed Centers)
 # -------------------------------------------------------------
 
 def run_kmeans_clustering(
@@ -225,6 +227,8 @@ def run_kmeans_clustering(
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     """
     Groups data points by feature similarity using K-Means.
+    Inverse-transforms cluster centers to original data coordinates so centroids
+    are interpretable in original feature units.
     """
     sub = df[features].dropna().copy()
     if len(sub) < n_clusters:
@@ -233,25 +237,43 @@ def run_kmeans_clustering(
     X = sub.values
     if scale:
         scaler = StandardScaler()
-        X = scaler.fit_transform(X)
+        X_fit = scaler.fit_transform(X)
+    else:
+        scaler = None
+        X_fit = X
 
     kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-    clusters = kmeans.fit_predict(X)
+    clusters = kmeans.fit_predict(X_fit)
+
+    # Convert centers back to original feature scale
+    if scaler is not None:
+        raw_centers = scaler.inverse_transform(kmeans.cluster_centers_)
+    else:
+        raw_centers = kmeans.cluster_centers_
 
     result_df = sub.copy()
     result_df["Cluster"] = [f"Cluster {c}" for c in clusters]
     cluster_counts = result_df["Cluster"].value_counts().to_dict()
 
+    # Build center dataframe
+    centers_df = pd.DataFrame(
+        raw_centers.round(4),
+        columns=features,
+        index=[f"Cluster {c}" for c in range(n_clusters)]
+    ).reset_index()
+    centers_df.rename(columns={"index": "Cluster"}, inplace=True)
+
     return result_df, {
         "n_clusters": n_clusters,
         "inertia": round(float(kmeans.inertia_), 2),
         "cluster_counts": cluster_counts,
-        "cluster_centers": kmeans.cluster_centers_.tolist()
+        "cluster_centers": centers_df.to_dict(orient="records"),
+        "centers_dataframe": centers_df
     }
 
 
 # -------------------------------------------------------------
-# Feature 40: Dimensionality Reduction (PCA)
+# Feature 40: Dimensionality Reduction (PCA with Loadings & Contributions)
 # -------------------------------------------------------------
 
 def run_pca_reduction(
@@ -261,7 +283,7 @@ def run_pca_reduction(
     scale: bool = True
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     """
-    Computes PCA for 2D or 3D visualization.
+    Feature 40: PCA with feature loadings, variable contributions, and explained variance.
     """
     sub = df[features].dropna().copy()
     if len(sub) < n_components or len(features) < n_components:
@@ -270,10 +292,12 @@ def run_pca_reduction(
     X = sub.values
     if scale:
         scaler = StandardScaler()
-        X = scaler.fit_transform(X)
+        X_fit = scaler.fit_transform(X)
+    else:
+        X_fit = X
 
     pca = PCA(n_components=n_components, random_state=42)
-    coords = pca.fit_transform(X)
+    coords = pca.fit_transform(X_fit)
 
     col_names = [f"PC{i+1}" for i in range(n_components)]
     pca_df = pd.DataFrame(coords, columns=col_names, index=sub.index)
@@ -281,10 +305,27 @@ def run_pca_reduction(
     explained_var = [round(float(v) * 100, 2) for v in pca.explained_variance_ratio_]
     total_var = round(float(sum(explained_var)), 2)
 
+    # Calculate feature loadings (eigenvectors)
+    loadings_df = pd.DataFrame(
+        pca.components_.T,
+        columns=col_names,
+        index=features
+    ).round(4).reset_index().rename(columns={"index": "Feature"})
+
+    # Calculate relative feature contributions
+    contributions = (pca.components_ ** 2) / np.sum(pca.components_ ** 2, axis=1, keepdims=True)
+    contributions_df = pd.DataFrame(
+        (contributions.T * 100).round(2),
+        columns=[f"{col}_Contribution_Pct" for col in col_names],
+        index=features
+    ).reset_index().rename(columns={"index": "Feature"})
+
     return pca_df, {
         "components": n_components,
         "explained_variance_ratio": explained_var,
-        "total_explained_variance": total_var
+        "total_explained_variance": total_var,
+        "loadings": loadings_df,
+        "contributions": contributions_df
     }
 
 

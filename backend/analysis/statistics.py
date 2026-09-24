@@ -5,7 +5,7 @@ Features 14-19:
 15. Categorical Frequency Distribution (value counts, percentages, unique value tallies)
 16. Missingness Matrix (visual heatmaps of missing data patterns)
 17. Correlation Matrix (Pearson, Spearman, and Kendall coefficients)
-18. Multi-Collinearity Detection (automated warnings for correlated predictor variables)
+18. Highly Correlated Feature Pairs & VIF Multi-Collinearity Analysis
 19. Skewness & Kurtosis Analysis (symmetry and tail heaviness measurements)
 """
 
@@ -58,7 +58,12 @@ def compute_categorical_distribution(df: pd.DataFrame, max_categories: int = 20)
     Feature 15: Categorical Frequency Distribution.
     Detects categorical, string, and object columns cleanly without pandas select_dtypes deprecations.
     """
-    cat_cols = [c for c in df.columns if isinstance(df[c].dtype, (pd.CategoricalDtype, pd.StringDtype)) or df[c].dtype == "object" or pd.api.types.is_bool_dtype(df[c])]
+    cat_cols = [
+        c for c in df.columns
+        if isinstance(df[c].dtype, (pd.CategoricalDtype, pd.StringDtype))
+        or df[c].dtype == "object"
+        or pd.api.types.is_bool_dtype(df[c])
+    ]
     distributions = {}
 
     for col in cat_cols:
@@ -116,10 +121,10 @@ def compute_correlation_matrix(df: pd.DataFrame, method: str = "pearson") -> pd.
     return corr.round(4)
 
 
-def detect_multicollinearity(df: pd.DataFrame, threshold: float = 0.80) -> List[Dict[str, Any]]:
+def detect_highly_correlated_pairs(df: pd.DataFrame, threshold: float = 0.80) -> List[Dict[str, Any]]:
     """
-    Feature 18: Multi-Collinearity Detection.
-    Automated warnings for correlated predictor variables.
+    Feature 18: Highly Correlated Feature Pairs (Pairwise Correlation Analysis).
+    Identifies predictor pairs exceeding correlation threshold.
     """
     num_df = df.select_dtypes(include=[np.number]).dropna()
     if num_df.shape[1] < 2:
@@ -143,6 +148,56 @@ def detect_multicollinearity(df: pd.DataFrame, threshold: float = 0.80) -> List[
                 })
 
     return sorted(high_corr_pairs, key=lambda x: x["correlation"], reverse=True)
+
+
+def compute_variance_inflation_factors(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Feature 18b: Variance Inflation Factor (VIF) Multi-Collinearity Calculation.
+    VIF = 1 / (1 - R_i^2) where each feature is regressed against all other numeric predictors.
+    """
+    num_df = df.select_dtypes(include=[np.number]).dropna()
+    if num_df.shape[1] < 2 or len(num_df) < num_df.shape[1]:
+        return pd.DataFrame(columns=["Feature", "VIF", "Collinearity_Status"])
+
+    vif_records = []
+    cols = num_df.columns.tolist()
+
+    for col in cols:
+        y = num_df[col].values
+        other_cols = [c for c in cols if c != col]
+        X = num_df[other_cols].values
+        # Add intercept column
+        X_with_const = np.column_stack([np.ones(len(X)), X])
+
+        try:
+            # OLS closed form solution
+            beta, residuals, rank, s = np.linalg.lstsq(X_with_const, y, rcond=None)
+            y_pred = X_with_const @ beta
+            ss_tot = np.sum((y - np.mean(y)) ** 2)
+            ss_res = np.sum((y - y_pred) ** 2)
+            r_squared = 1.0 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
+
+            if r_squared >= 0.9999:
+                vif = float("inf")
+            else:
+                vif = float(1.0 / (1.0 - r_squared))
+        except Exception:
+            vif = 1.0
+
+        if vif > 10.0:
+            status = "High Multicollinearity (VIF > 10)"
+        elif vif > 5.0:
+            status = "Moderate Multicollinearity (5 < VIF <= 10)"
+        else:
+            status = "Low Multicollinearity (VIF <= 5)"
+
+        vif_records.append({
+            "Feature": col,
+            "VIF": round(vif, 2) if vif != float("inf") else 999.99,
+            "Collinearity_Status": status
+        })
+
+    return pd.DataFrame(vif_records).sort_values(by="VIF", ascending=False).reset_index(drop=True)
 
 
 def compute_skewness_kurtosis(df: pd.DataFrame) -> pd.DataFrame:

@@ -3,7 +3,7 @@ Exporting & Reporting module.
 Features 48-52:
 48. Cleaned Dataset Export (CSV, Excel, Parquet download bytes)
 49. Chart Image Export (PNG, SVG, HTML saving)
-50. Automated Executive Summary (plain-English narrative of key statistical findings)
+50. Automated Executive Summary (deterministic rule-based analytical report)
 51. Comprehensive HTML Report Generation
 52. Dynamic Multi-Page PDF Report Export with Auto-Wrapping Tables
 """
@@ -66,13 +66,15 @@ def export_chart_html(fig: go.Figure) -> str:
 
 
 # -------------------------------------------------------------
-# Feature 50: Automated Executive Summary
+# Feature 50: Automated Executive Summary (Deterministic Engine)
 # -------------------------------------------------------------
 
 def generate_executive_summary(df: pd.DataFrame, audit_logs: Optional[List[Dict[str, Any]]] = None) -> str:
     """
-    Produces a plain-English, professional executive narrative of key dataset properties,
-    statistical patterns, missingness, and detected data qualities.
+    Feature 50: Automated Executive Summary.
+    Produces a plain-English, professional executive narrative of dataset properties,
+    statistical patterns, missingness, and detected data qualities using deterministic
+    analytical rules (not an LLM).
     """
     n_rows, n_cols = df.shape
     num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
@@ -84,10 +86,10 @@ def generate_executive_summary(df: pd.DataFrame, audit_logs: Optional[List[Dict[
 
     sections = []
 
-    # 1. Dataset Dimensions & Integrity
+    # 1. Dataset Scale & Completeness
     sections.append(
-        f"**Dataset Overview and Scale**\n"
-        f"The dataset comprises {n_rows:,} records across {n_cols} attributes, including {len(num_cols)} numerical "
+        f"**Dataset Dimensions and Integrity Overview**\n"
+        f"The active dataset comprises {n_rows:,} records across {n_cols} attributes, including {len(num_cols)} numerical "
         f"features and {len(cat_cols)} categorical dimensions. Memory utilization is currently optimized. "
         f"A total of {missing_cells:,} missing data points were detected, representing {missing_pct}% of total cells. "
         f"{duplicates:,} duplicate rows were identified."
@@ -112,7 +114,8 @@ def generate_executive_summary(df: pd.DataFrame, audit_logs: Optional[List[Dict[
     # 3. Categorical Breakdown
     if cat_cols:
         primary_cat = cat_cols[0]
-        top_val = df[primary_cat].mode().iloc[0] if len(df[primary_cat].mode()) > 0 else "N/A"
+        mode_series = df[primary_cat].dropna().mode()
+        top_val = mode_series.iloc[0] if len(mode_series) > 0 else "N/A"
         unique_cnt = df[primary_cat].nunique()
         sections.append(
             f"**Categorical Composition**\n"
@@ -126,7 +129,7 @@ def generate_executive_summary(df: pd.DataFrame, audit_logs: Optional[List[Dict[
         sections.append(
             f"**Transformation Audit Trail**\n"
             f"A total of {steps_count} data preparation steps were executed during this analytical session, "
-            f"including schema verification, missing value imputation, and duplicate purging."
+            f"including schema verification, missing value handling, and duplicate purging."
         )
     else:
         sections.append(
@@ -148,8 +151,7 @@ def generate_html_report(
     figures: Optional[List[go.Figure]] = None
 ) -> str:
     """
-    Generates a standalone, polished HTML analytical report with embedded styling,
-    data tables, and charts.
+    Feature 51: Standalone HTML Analytical Report.
     """
     n_rows, n_cols = df.shape
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -216,6 +218,11 @@ def generate_html_report(
             margin-top: 32px;
             margin-bottom: 12px;
         }}
+        h3 {{
+            color: #374151;
+            font-size: 16px;
+            margin-top: 16px;
+        }}
         .executive-summary {{
             background: #f3f4f6;
             border-left: 4px solid #2563eb;
@@ -281,7 +288,7 @@ def generate_html_report(
 
 
 # -------------------------------------------------------------
-# Feature 52: Multi-Page PDF Report with Dynamic Flowable Tables
+# Feature 52: Dynamic Multi-Page PDF Report Export
 # -------------------------------------------------------------
 
 def generate_pdf_report(
@@ -290,9 +297,9 @@ def generate_pdf_report(
     audit_logs: Optional[List[Dict[str, Any]]] = None
 ) -> bytes:
     """
-    Builds an executive PDF report using ReportLab.
-    Dynamically computes printable page width and wraps every table cell in a
-    Paragraph flowable to prevent clipping or page overflow.
+    Feature 52: Printable Executive PDF Report.
+    Dynamically wraps text cells in Paragraph flowables to prevent text clipping
+    or page boundary overflow.
     """
     buffer = io.BytesIO()
     margin = 36
@@ -304,7 +311,7 @@ def generate_pdf_report(
         topMargin=margin,
         bottomMargin=margin
     )
-    printable_width = letter[0] - (2 * margin)  # 540 pt
+    printable_width = letter[0] - (2 * margin)
 
     styles = getSampleStyleSheet()
     title_style = ParagraphStyle(
@@ -371,21 +378,18 @@ def generate_pdf_report(
 
     elements.append(Spacer(1, 10))
 
-    # Descriptive Statistics Table with auto-wrapped cells
+    # Descriptive Statistics Table
     elements.append(Paragraph("Descriptive Statistics", h2_style))
     num_df = df.describe().round(2).reset_index()
 
     if not num_df.empty:
-        # Limit to first 6 metrics to ensure readable column spacing
         selected_cols = list(num_df.columns[:min(6, len(num_df.columns))])
         col_width = printable_width / len(selected_cols)
 
         table_flowables = []
-        # Header row
         header_row = [Paragraph(str(c), header_cell_style) for c in selected_cols]
         table_flowables.append(header_row)
 
-        # Value rows
         for _, row in num_df[selected_cols].iterrows():
             row_cells = [Paragraph(str(val), cell_style) for val in row]
             table_flowables.append(row_cells)
@@ -403,7 +407,7 @@ def generate_pdf_report(
         ]))
         elements.append(t)
 
-    # Lineage Audit Trail Table with auto-wrapped cells
+    # Lineage Audit Trail Table
     if audit_logs:
         elements.append(Spacer(1, 12))
         elements.append(Paragraph("Data Lineage and Transformation History", h2_style))
