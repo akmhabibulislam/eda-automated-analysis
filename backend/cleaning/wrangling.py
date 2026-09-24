@@ -17,7 +17,12 @@ import pandas as pd
 import numpy as np
 
 from backend.cleaning.cleaning import AuditLogger
-from backend.core.validation import validate_cardinality_guard, validate_merge_safety, ValidationError
+from backend.core.validation import (
+    validate_cardinality_guard,
+    validate_merge_safety,
+    ValidationError,
+    ResourceLimitError
+)
 
 
 ALLOWED_FUNCTIONS = {
@@ -217,22 +222,31 @@ def aggregate_groupby(
     max_groups_limit: int = 50000
 ) -> pd.DataFrame:
     """
-    Feature 22: SQL-like Groupby & Aggregations with cardinality and resource safety limits.
-    Estimates potential Cartesian group explosion before execution.
+    Feature 22: SQL-like Groupby & Aggregations with pre-execution resource limits.
+    Calculates estimated potential groups up front and raises ResourceLimitError before execution.
     """
     for col in group_columns:
         if col not in df.columns:
             raise ValueError(f"Group column '{col}' not found.")
         validate_cardinality_guard(df, col, max_cardinality=1000)
 
-    # Estimate theoretical max groups
+    # Estimate theoretical max groups before execution
     est_groups = 1
     for col in group_columns:
         est_groups *= int(df[col].nunique(dropna=True))
 
+    # Pre-execution guard: if worst-case combinations exceed threshold by order of magnitude, verify existing combinations
+    if est_groups > max_groups_limit:
+        actual_groups_count = len(df.drop_duplicates(subset=group_columns))
+        if actual_groups_count > max_groups_limit:
+            raise ResourceLimitError(
+                f"Groupby Pre-Execution Guard: Target groupings contain {actual_groups_count:,} distinct groups, "
+                f"exceeding maximum permitted safety ceiling of {max_groups_limit:,}."
+            )
+
     grouped = df.groupby(group_columns, observed=False).agg(aggregations)
     if len(grouped) > max_groups_limit:
-        raise ValueError(f"Groupby result produced {len(grouped):,} groups, exceeding safety limit of {max_groups_limit:,}.")
+        raise ResourceLimitError(f"Groupby result produced {len(grouped):,} groups, exceeding safety limit of {max_groups_limit:,}.")
 
     if isinstance(grouped.columns, pd.MultiIndex):
         grouped.columns = [f"{col}_{agg}" for col, agg in grouped.columns]
@@ -360,7 +374,7 @@ def pivot_dataframe(
     est_total_cells = est_rows * est_cols
 
     if est_total_cells > max_cells_limit:
-        raise ValueError(
+        raise ResourceLimitError(
             f"Pivot Explosion Guard: Estimated output of {est_rows:,} rows x {est_cols:,} columns "
             f"({est_total_cells:,} total cells) exceeds safety ceiling of {max_cells_limit:,} cells."
         )
@@ -409,8 +423,9 @@ def filter_rows_structured(
     logger: Optional[AuditLogger] = None
 ) -> pd.DataFrame:
     """
-    Feature 26: Secure, structured row filtering.
-    Does not convert NaN to 'nan' string during comparison operations.
+    Feature 26: Secure, structured row filtering with semantic type enforcement.
+    - 'contains' is restricted strictly to text/string/categorical columns.
+    - 'in' casts comparison items according to the column's actual dtype.
     """
     if column not in df.columns:
         raise ValueError(f"Column '{column}' not found in dataframe.")
@@ -419,9 +434,15 @@ def filter_rows_structured(
     s = df[column]
 
     if operator == "==":
-        mask = s == comparison_value
+        if pd.api.types.is_numeric_dtype(s):
+            mask = s == float(comparison_value)
+        else:
+            mask = s == comparison_value
     elif operator == "!=":
-        mask = s != comparison_value
+        if pd.api.types.is_numeric_dtype(s):
+            mask = s != float(comparison_value)
+        else:
+            mask = s != comparison_value
     elif operator == ">":
         val = float(comparison_value)
         mask = (s > val) & s.notna()
@@ -435,11 +456,25 @@ def filter_rows_structured(
         val = float(comparison_value)
         mask = (s <= val) & s.notna()
     elif operator == "contains":
+        # Semantic typing guard: only string/object/categorical columns permitted
+        if pd.api.types.is_numeric_dtype(s) or pd.api.types.is_datetime64_any_dtype(s):
+            raise ValueError(f"Semantic Guard: Operator 'contains' can only be applied to text/categorical columns, not numeric column '{column}'.")
         str_series = s.astype("string")
         mask = str_series.str.contains(str(comparison_value), case=False, na=False)
     elif operator == "in":
-        val_list = [v.strip() for v in str(comparison_value).split(",")]
-        mask = s.isin(val_list) & s.notna()
+        # Type-aware parsing of comma-separated items
+        raw_items = [v.strip() for v in str(comparison_value).split(",") if v.strip()]
+        if pd.api.types.is_numeric_dtype(s):
+            try:
+                parsed_items = [float(v) if "." in v else int(v) for v in raw_items]
+            except ValueError:
+                parsed_items = raw_items
+            mask = s.isin(parsed_items) & s.notna()
+        elif pd.api.types.is_datetime64_any_dtype(s):
+            parsed_items = pd.to_datetime(raw_items, errors="coerce")
+            mask = s.isin(parsed_items) & s.notna()
+        else:
+            mask = s.astype(str).isin(raw_items) & s.notna()
     else:
         raise ValueError(f"Unsupported query operator '{operator}'. Allowed: {SUPPORTED_QUERY_OPERATORS}")
 

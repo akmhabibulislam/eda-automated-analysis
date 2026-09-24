@@ -19,6 +19,24 @@ from sklearn.decomposition import PCA
 from sklearn.ensemble import IsolationForest
 from sklearn.preprocessing import StandardScaler
 
+from backend.ingestion.loaders import detect_schema
+
+
+def validate_modeling_features_no_identifiers(df: pd.DataFrame, features: List[str]) -> List[str]:
+    """
+    Validates feature list against semantic identifiers (UUIDs, transaction IDs, customer IDs).
+    Raises ValueError if raw identifiers are passed into modeling algorithms.
+    """
+    schema = detect_schema(df)
+    roles = schema.get("semantic_roles", {})
+    rejected = [f for f in features if roles.get(f) in ["identifier", "uuid"]]
+    if rejected:
+        raise ValueError(
+            f"Semantic Modeling Guard: Column(s) {rejected} are detected as unique identifiers or UUIDs. "
+            f"Raw identifiers cannot be used as features for K-Means, PCA, or Isolation Forest."
+        )
+    return features
+
 
 # -------------------------------------------------------------
 # Feature 37: Curve Fitting & Trendline Equations
@@ -230,6 +248,7 @@ def run_kmeans_clustering(
     Inverse-transforms cluster centers to original data coordinates so centroids
     are interpretable in original feature units.
     """
+    validate_modeling_features_no_identifiers(df, features)
     sub = df[features].dropna().copy()
     if len(sub) < n_clusters:
         raise ValueError("Number of samples must exceed number of clusters.")
@@ -285,6 +304,7 @@ def run_pca_reduction(
     """
     Feature 40: PCA with feature loadings, variable contributions, and explained variance.
     """
+    validate_modeling_features_no_identifiers(df, features)
     sub = df[features].dropna().copy()
     if len(sub) < n_components or len(features) < n_components:
         raise ValueError("Insufficient features or rows for requested PCA components.")
@@ -341,6 +361,7 @@ def run_isolation_forest_anomaly_detection(
     """
     Detects multivariate anomalies and computes anomaly scores using Isolation Forest.
     """
+    validate_modeling_features_no_identifiers(df, features)
     sub = df[features].dropna().copy()
     if len(sub) < 10:
         raise ValueError("Anomaly detection requires at least 10 observations.")

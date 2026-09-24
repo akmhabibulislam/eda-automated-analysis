@@ -10,9 +10,11 @@ Features 48-52:
 
 import io
 import datetime
+import html
 from typing import Dict, Any, List, Optional, Tuple
 import pandas as pd
 import numpy as np
+from scipy import stats
 import plotly.graph_objects as go
 from reportlab.lib.pagesizes import letter
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
@@ -99,29 +101,40 @@ def generate_executive_summary(df: pd.DataFrame, audit_logs: Optional[List[Dict[
     if num_cols:
         primary_num = num_cols[0]
         s = df[primary_num].dropna()
-        if len(s) > 0:
-            mean_val = s.mean()
-            median_val = s.median()
-            std_val = s.std()
-            skew_desc = "positively skewed" if mean_val > median_val else "negatively skewed or symmetrical"
+        if len(s) >= 3:
+            mean_val = float(s.mean())
+            median_val = float(s.median())
+            std_val = float(s.std())
+            # Compute actual Fisher-Pearson standardized moment coefficient from scipy
+            skew_val = float(stats.skew(s, bias=False))
+            if skew_val > 0.5:
+                skew_desc = f"moderately-to-highly right-skewed (positive skewness = {skew_val:.2f})"
+            elif skew_val < -0.5:
+                skew_desc = f"moderately-to-highly left-skewed (negative skewness = {skew_val:.2f})"
+            else:
+                skew_desc = f"substantially symmetric (skewness = {skew_val:.2f})"
+
             sections.append(
                 f"**Numerical Distribution Characteristics**\n"
-                f"Primary continuous metric '{primary_num}' exhibits a mean of {mean_val:.2f}, median of {median_val:.2f}, "
-                f"and standard deviation of {std_val:.2f}. The relationship between the mean and median indicates that the "
+                f"Primary continuous metric '{primary_num}' exhibits a sample mean of {mean_val:.2f}, median of {median_val:.2f}, "
+                f"and standard deviation of {std_val:.2f}. The computed third standardized moment indicates that the "
                 f"distribution is {skew_desc}."
             )
 
     # 3. Categorical Breakdown
     if cat_cols:
         primary_cat = cat_cols[0]
-        mode_series = df[primary_cat].dropna().mode()
-        top_val = mode_series.iloc[0] if len(mode_series) > 0 else "N/A"
-        unique_cnt = df[primary_cat].nunique()
-        sections.append(
-            f"**Categorical Composition**\n"
-            f"For attribute '{primary_cat}', there are {unique_cnt} unique categories. The dominant class is "
-            f"'{top_val}', highlighting significant concentration within this dimension."
-        )
+        mode_series = df[primary_cat].dropna().value_counts()
+        if len(mode_series) > 0:
+            top_val = mode_series.index[0]
+            top_count = int(mode_series.iloc[0])
+            top_pct = (top_count / len(df[primary_cat].dropna()) * 100) if len(df[primary_cat].dropna()) > 0 else 0.0
+            unique_cnt = df[primary_cat].nunique()
+            sections.append(
+                f"**Categorical Composition**\n"
+                f"For attribute '{primary_cat}', there are {unique_cnt} unique categories. The most frequent category is "
+                f"'{top_val}', accounting for {top_count:,} occurrences ({top_pct:.2f}% of non-null observations)."
+            )
 
     # 4. Data Lineage and Cleaning Actions
     if audit_logs:
@@ -160,11 +173,11 @@ def generate_html_report(
     n_rows, n_cols = df.shape
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    fp_display = fingerprint_sha256 if fingerprint_sha256 else "N/A"
+    fp_display = html.escape(str(fingerprint_sha256)) if fingerprint_sha256 else "N/A"
 
     provenance_html = ""
     if provenance:
-        prov_items = "".join([f"<li><strong>{k}:</strong> {v}</li>" for k, v in provenance.items()])
+        prov_items = "".join([f"<li><strong>{html.escape(str(k))}:</strong> {html.escape(str(v))}</li>" for k, v in provenance.items()])
         provenance_html = f"""
         <div class="provenance-box">
             <h3>Software Environment & Reproducibility Provenance</h3>
@@ -172,9 +185,9 @@ def generate_html_report(
         </div>
         """
 
-    preview_table_html = df.head(10).to_html(classes="styled-table", index=False)
+    preview_table_html = df.head(10).to_html(classes="styled-table", index=False, escape=True)
     num_df = df.describe().round(2).reset_index()
-    num_table_html = num_df.to_html(classes="styled-table", index=False) if not num_df.empty else "<p>No numeric columns.</p>"
+    num_table_html = num_df.to_html(classes="styled-table", index=False, escape=True) if not num_df.empty else "<p>No numeric columns.</p>"
 
     charts_html = ""
     if figures:
@@ -191,8 +204,10 @@ def generate_html_report(
         audit_df = pd.DataFrame(audit_logs)
         audit_table_html = f"""
         <h2>Data Transformation Audit Trail</h2>
-        {audit_df.to_html(classes="styled-table", index=False)}
+        {audit_df.to_html(classes="styled-table", index=False, escape=True)}
         """
+
+    clean_narrative = "<br>".join(html.escape(line) for line in summary_text.splitlines())
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -300,7 +315,7 @@ def generate_html_report(
 
         <h2>Executive Narrative</h2>
         <div class="executive-summary">
-            {summary_text.replace(chr(10), '<br>')}
+            {clean_narrative}
         </div>
 
         <h2>Dataset Sample (First 10 Records)</h2>

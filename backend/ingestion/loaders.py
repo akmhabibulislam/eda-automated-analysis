@@ -196,16 +196,17 @@ def load_from_database(
         if re.search(pattern, upper_query):
             raise ValueError(f"Security Violation: Prohibited query keyword '{kw}' detected.")
 
-    # Inject database-side LIMIT if not present or replace if larger than max_rows
+    # Enforce actual_limit = min(user_limit, max_rows)
     limit_match = re.search(r"\bLIMIT\s+(\d+)\b", upper_query)
     if not limit_match:
-        executed_query = f"{clean_query} LIMIT {max_rows}"
+        actual_limit = max_rows
+        executed_query = f"{clean_query} LIMIT {actual_limit}"
     else:
-        existing_limit = int(limit_match.group(1))
-        if existing_limit > max_rows:
-            executed_query = re.sub(r"\bLIMIT\s+\d+\b", f"LIMIT {max_rows}", clean_query, flags=re.IGNORECASE)
-        else:
-            executed_query = clean_query
+        user_limit = int(limit_match.group(1))
+        actual_limit = min(user_limit, max_rows)
+        # Safely replace the matched limit substring with actual_limit
+        start_idx, end_idx = limit_match.span()
+        executed_query = f"{clean_query[:start_idx]}LIMIT {actual_limit}{clean_query[end_idx:]}"
 
     # Configure read-only connection with execution timeout
     connect_args = {}

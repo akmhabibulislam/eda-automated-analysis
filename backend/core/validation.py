@@ -18,6 +18,11 @@ class ValidationError(ValueError):
     pass
 
 
+class ResourceLimitError(ValidationError):
+    """Raised when an operation would exceed pre-execution computational or memory bounds."""
+    pass
+
+
 def validate_dataframe_not_empty(df: pd.DataFrame, min_rows: int = 1) -> None:
     """Ensure dataframe is non-null and meets minimum row requirements."""
     if df is None:
@@ -167,7 +172,7 @@ def validate_merge_safety(
         estimated_max = min(len(left_df) * max_right_key_freq, max_output_rows + 1)
 
     if estimated_max > max_output_rows:
-        raise ValidationError(
+        raise ResourceLimitError(
             f"Merge Resource Guard: Potential Cartesian explosion detected! "
             f"Estimated possible join size could reach {estimated_max:,} rows, "
             f"exceeding maximum permitted safety ceiling of {max_output_rows:,} rows."

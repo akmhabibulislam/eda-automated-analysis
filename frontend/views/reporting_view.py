@@ -61,6 +61,14 @@ def render_reporting_view(session_manager: DatasetSessionManager, recent_figures
                 )
                 st.plotly_chart(built_f, use_container_width=True)
                 register_fig_callback(built_f)
+                chart_html = export_chart_html(built_f)
+                st.download_button(
+                    "Export Chart as Interactive HTML",
+                    data=chart_html,
+                    file_name="datasight_chart.html",
+                    mime="text/html",
+                    key="export_chart_btn"
+                )
             except Exception as e:
                 st.error(f"Render error: {str(e)}")
 

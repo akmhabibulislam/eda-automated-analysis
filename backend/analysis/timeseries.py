@@ -79,30 +79,50 @@ def compute_period_over_period_growth(
     date_column: Optional[str] = None,
     periods: int = 1,
     frequency: Optional[str] = None,
-    growth_col_name: Optional[str] = None
+    growth_col_name: Optional[str] = None,
+    resample_aggregation: str = "sum"
 ) -> pd.DataFrame:
     """
-    Feature 34: Period-over-Period Growth with true calendar frequency validation.
-    When frequency (e.g. 'M' for month, 'Y' for year) is provided, validates that intervals
-    correspond to genuine calendar intervals rather than arbitrary consecutive row shifts.
-    Preserves original row alignment.
+    Feature 34: Period-over-Period Growth with true calendar-aware resampling.
+    When frequency (e.g., 'ME' for monthly, 'YE' for yearly) is specified, the data is
+    temporally resampled to guarantee true calendar alignment rather than naive row shifts.
     """
+    if date_column and frequency:
+        freq_norm = frequency.upper()
+        if freq_norm in ["M", "MONTH", "MONTHLY"]:
+            freq_code = "ME"
+        elif freq_norm in ["Y", "YEAR", "YEARLY", "A"]:
+            freq_code = "YE"
+        elif freq_norm in ["D", "DAY", "DAILY"]:
+            freq_code = "D"
+        elif freq_norm in ["W", "WEEK", "WEEKLY"]:
+            freq_code = "W"
+        else:
+            freq_code = frequency
+
+        # Group and resample to calendar intervals
+        sub = df[[date_column, value_column]].dropna().copy()
+        sub[date_column] = pd.to_datetime(sub[date_column])
+        sub = sub.sort_values(by=date_column).set_index(date_column)
+
+        resampled = sub.resample(freq_code).agg(resample_aggregation)
+        target_name = growth_col_name if growth_col_name else f"{value_column}_growth_{periods}{freq_code}"
+        diff_name = f"{value_column}_diff_{periods}{freq_code}"
+
+        resampled[diff_name] = resampled[value_column].diff(periods=periods)
+        resampled[target_name] = (resampled[value_column].pct_change(periods=periods) * 100).round(2)
+        return resampled.reset_index()
+
+    # Fallback to row-level differences if no calendar frequency requested
     original_index = df.index
     result = ensure_sorted_timeseries(df, date_column) if date_column else df.copy()
 
     target_name = growth_col_name if growth_col_name else f"{value_column}_pct_change_{periods}"
     abs_name = f"{value_column}_diff_{periods}"
 
-    if date_column and frequency:
-        # Validate that timestamps match requested calendar frequency
-        dt_series = pd.to_datetime(result[date_column])
-        inferred_freq = pd.infer_freq(dt_series)
-        result["_inferred_freq"] = inferred_freq or "irregular"
-
     result[abs_name] = result[value_column].diff(periods=periods)
     result[target_name] = (result[value_column].pct_change(periods=periods) * 100).round(2)
 
-    # Reindex back to original row order if needed
     if not date_column:
         result = result.reindex(original_index)
 
