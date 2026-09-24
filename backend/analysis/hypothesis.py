@@ -6,12 +6,66 @@ Features 27-31:
 29. Chi-Square Test of Independence
 30. Mann-Whitney U / Kruskal-Wallis Non-Parametric Tests
 31. Distribution Fitting (Kolmogorov-Smirnov evaluation with transparent parameter disclosure)
+Includes Multiple-Testing Corrections: Bonferroni and Benjamini-Hochberg (FDR).
 """
 
 from typing import Dict, Any, List, Optional, Union
 import pandas as pd
 import numpy as np
 from scipy import stats
+
+from backend.core.validation import (
+    validate_numeric_finite_column,
+    validate_non_zero_variance,
+    validate_dataframe_not_empty
+)
+
+
+def apply_multiple_testing_correction(
+    p_values: List[float],
+    method: str = "benjamini_hochberg",
+    alpha: float = 0.05
+) -> Dict[str, Any]:
+    """
+    Applies multiple comparison adjustments to family-wise error rates.
+    Supported: 'bonferroni', 'benjamini_hochberg' (FDR).
+    """
+    m = len(p_values)
+    if m == 0:
+        return {"adjusted_p_values": [], "significant": []}
+
+    p_arr = np.array(p_values, dtype=float)
+
+    if method == "bonferroni":
+        adj_p = np.clip(p_arr * m, 0.0, 1.0)
+        sig = adj_p < alpha
+    elif method == "benjamini_hochberg":
+        # Sort p-values ascending
+        sorted_indices = np.argsort(p_arr)
+        sorted_p = p_arr[sorted_indices]
+
+        # FDR threshold: (k / m) * alpha
+        adj_p_sorted = np.zeros(m)
+        for k in range(m, 0, -1):
+            adj_p_sorted[k - 1] = sorted_p[k - 1] * m / k
+
+        # Enforce monotonicity: p_i <= p_{i+1}
+        for k in range(m - 2, -1, -1):
+            adj_p_sorted[k] = min(adj_p_sorted[k], adj_p_sorted[k + 1])
+
+        adj_p_sorted = np.clip(adj_p_sorted, 0.0, 1.0)
+        adj_p = np.zeros(m)
+        adj_p[sorted_indices] = adj_p_sorted
+        sig = adj_p < alpha
+    else:
+        raise ValueError(f"Unknown correction method '{method}'. Choose 'bonferroni' or 'benjamini_hochberg'.")
+
+    return {
+        "method": method,
+        "nominal_alpha": alpha,
+        "adjusted_p_values": [round(float(p), 4) for p in adj_p],
+        "significant": [bool(s) for s in sig]
+    }
 
 
 def run_t_test(
@@ -22,11 +76,9 @@ def run_t_test(
 ) -> Dict[str, Any]:
     """
     Feature 27: Independent and Paired T-Tests.
-    For paired tests, index-aligns observations and drops missing pairs simultaneously
-    to ensure pairwise integrity.
+    For paired tests, index-aligns observations and drops missing pairs simultaneously.
     """
     if test_type == "paired":
-        # Ensure series structure for index alignment
         s_a = pd.Series(sample_a)
         s_b = pd.Series(sample_b)
         paired_df = pd.DataFrame({"a": s_a, "b": s_b}).dropna()
@@ -37,6 +89,10 @@ def run_t_test(
         if len(clean_a) < 2:
             raise ValueError("Paired T-Test requires at least 2 complete, non-null paired observations.")
 
+        # Reject infinite values
+        if np.isinf(clean_a).any() or np.isinf(clean_b).any():
+            raise ValueError("Samples contain infinite values.")
+
         stat, p_val = stats.ttest_rel(clean_a, clean_b)
         test_name = "Paired Student's T-Test"
 
@@ -46,6 +102,9 @@ def run_t_test(
 
         if len(clean_a) < 2 or len(clean_b) < 2:
             raise ValueError("Each sample must have at least 2 non-null observations.")
+
+        if np.isinf(clean_a).any() or np.isinf(clean_b).any():
+            raise ValueError("Samples contain infinite values.")
 
         stat, p_val = stats.ttest_ind(clean_a, clean_b, equal_var=equal_var)
         test_name = "Welch's T-Test (Unequal Variance)" if not equal_var else "Student's T-Test (Equal Variance)"
@@ -79,11 +138,14 @@ def run_anova(groups: List[np.ndarray], group_names: Optional[List[str]] = None)
     """
     Feature 28: One-Way ANOVA (Analysis of Variance).
     """
-    clean_groups = [np.asarray(g)[~pd.isna(g)].astype(float) for g in groups]
-    clean_groups = [g for g in clean_groups if len(g) >= 2]
+    clean_groups = []
+    for g in groups:
+        arr = np.asarray(g)[~pd.isna(g)].astype(float)
+        if len(arr) >= 2 and not np.isinf(arr).any():
+            clean_groups.append(arr)
 
     if len(clean_groups) < 2:
-        raise ValueError("ANOVA requires at least 2 groups with >= 2 observations each.")
+        raise ValueError("ANOVA requires at least 2 groups with >= 2 finite observations each.")
 
     stat, p_val = stats.f_oneway(*clean_groups)
     alpha = 0.05
@@ -147,10 +209,10 @@ def run_non_parametric_tests(
     group_names: Optional[List[str]] = None
 ) -> Dict[str, Any]:
     """
-    Feature 30: Mann-Whitney U (2 groups) or Kruskal-Wallis (> 2 groups) Non-Parametric Tests.
+    Feature 30: Mann-Whitney U or Kruskal-Wallis Non-Parametric Tests.
     """
     clean_groups = [np.asarray(g)[~pd.isna(g)].astype(float) for g in groups]
-    clean_groups = [g for g in clean_groups if len(g) >= 2]
+    clean_groups = [g for g in clean_groups if len(g) >= 2 and not np.isinf(g).any()]
 
     if len(clean_groups) < 2:
         raise ValueError("Non-parametric test requires at least 2 valid groups.")
@@ -194,12 +256,12 @@ def run_non_parametric_tests(
 def fit_distributions(data: np.ndarray) -> pd.DataFrame:
     """
     Feature 31: Distribution Fitting via Kolmogorov-Smirnov Tests.
-    Clearly discloses fitted sample parameters and presents statistically accurate conclusions.
-    (Note: p-values are conservative due to sample parameter estimation).
     """
     clean_data = np.asarray(data)[~pd.isna(data)].astype(float)
+    clean_data = clean_data[np.isfinite(clean_data)]
+
     if len(clean_data) < 10:
-        raise ValueError("Distribution fitting requires at least 10 observations.")
+        raise ValueError("Distribution fitting requires at least 10 finite observations.")
 
     results = []
 

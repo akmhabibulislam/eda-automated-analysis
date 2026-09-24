@@ -3,10 +3,10 @@ Advanced Data Wrangling & Transformations module.
 Features 20-26:
 20. Secure Formula / Calculated Column Builder (AST-restricted parser)
 21. Binning & Discretization (grouping continuous numerical data into discrete ranges)
-22. SQL-like Groupby & Aggregations (grouping by categories and applying summary functions)
+22. SQL-like Groupby & Aggregations (with cardinality and group size safety guards)
 23. Merging & Joining (combining datasets using inner, left, right, or outer joins)
 24. Text Regex Extraction (pulling patterns like emails, phone numbers, zip codes)
-25. Data Pivoting & Unpivoting (reshaping between wide and long formats)
+25. Data Pivoting & Unpivoting (with strict cardinality protection)
 26. Structured Query Filtering (secure non-eval row selection)
 """
 
@@ -17,9 +17,9 @@ import pandas as pd
 import numpy as np
 
 from backend.cleaning.cleaning import AuditLogger
+from backend.core.validation import validate_cardinality_guard, ValidationError
 
 
-# Restricted mathematical functions allowed in secure AST evaluation
 ALLOWED_FUNCTIONS = {
     "abs": np.abs,
     "sqrt": np.sqrt,
@@ -108,12 +108,9 @@ def add_custom_formula_column(
 ) -> pd.DataFrame:
     """
     Feature 20: Secure AST-based Formula Builder.
-    Evaluates arithmetic and math expressions safely without arbitrary code execution risk.
-    Supports column aliases with spaces and backticks.
     """
     result = df.copy()
 
-    # Pre-process expression to map column names with spaces into valid AST identifiers
     clean_expr = expression
     alias_map = {}
     reverse_map = {}
@@ -195,16 +192,21 @@ def bin_continuous_column(
 def aggregate_groupby(
     df: pd.DataFrame,
     group_columns: List[str],
-    aggregations: Dict[str, List[str]]
+    aggregations: Dict[str, List[str]],
+    max_groups_limit: int = 50000
 ) -> pd.DataFrame:
     """
-    Feature 22: SQL-like Groupby & Aggregations.
+    Feature 22: SQL-like Groupby & Aggregations with cardinality and resource safety limits.
     """
     for col in group_columns:
         if col not in df.columns:
             raise ValueError(f"Group column '{col}' not found.")
+        validate_cardinality_guard(df, col, max_cardinality=1000)
 
     grouped = df.groupby(group_columns, observed=False).agg(aggregations)
+    if len(grouped) > max_groups_limit:
+        raise ValueError(f"Groupby result produced {len(grouped):,} groups, exceeding safety limit of {max_groups_limit:,}.")
+
     if isinstance(grouped.columns, pd.MultiIndex):
         grouped.columns = [f"{col}_{agg}" for col, agg in grouped.columns]
 
@@ -284,11 +286,14 @@ def pivot_dataframe(
     index_cols: List[str],
     columns: str,
     values: str,
-    aggfunc: str = "mean"
+    aggfunc: str = "mean",
+    max_column_cardinality: int = 100
 ) -> pd.DataFrame:
     """
-    Feature 25a: Reshaping - Long to Wide (Pivot).
+    Feature 25a: Reshaping - Long to Wide (Pivot) with strict column cardinality guards.
     """
+    validate_cardinality_guard(df, columns, max_cardinality=max_column_cardinality)
+
     pivoted = df.pivot_table(
         index=index_cols,
         columns=columns,
@@ -334,7 +339,6 @@ def filter_rows_structured(
 ) -> pd.DataFrame:
     """
     Feature 26: Secure, structured row filtering.
-    Replaces unrestricted eval/query strings with typed parametric comparisons.
     """
     if column not in df.columns:
         raise ValueError(f"Column '{column}' not found in dataframe.")

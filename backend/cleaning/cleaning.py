@@ -2,16 +2,17 @@
 Automated and Custom Data Cleaning module.
 Features 6-13:
 6. Missing Value Imputation (mean, median, mode, constant, forward/backward fill)
-7. Missing Value Dropping (threshold-based row/column removal)
+7. Missing Value Dropping (threshold-based with math.ceil non-null rounding)
 8. Duplicate Removal (exact and partial duplicate purging)
 9. Outlier Detection & Treatment (Z-score and IQR-based anomaly flagging with capping/clipping/dropping)
-10. Column Header Standardization (automatic whitespace removal and case formatting)
+10. Column Header Standardization (collision-proof naming with explicit mapping)
 11. Text & String Cleaning (preserving nulls, whitespace trimming, casing, special character stripping)
-12. Data Type Casting (manual and automatic conversion with robust boolean parsing)
+12. Data Type Casting (with unparsed token tracking and robust boolean parsing)
 13. Data Lineage / Audit Trail (chronological logging of all applied cleaning steps)
 """
 
 import re
+import math
 import datetime
 from typing import Dict, Any, List, Optional, Tuple, Union
 import pandas as pd
@@ -52,19 +53,23 @@ def standardize_column_headers(
     df: pd.DataFrame,
     case_style: str = "snake_case",
     logger: Optional[AuditLogger] = None
-) -> pd.DataFrame:
+) -> Tuple[pd.DataFrame, Dict[str, str]]:
     """
-    Feature 10: Column Header Standardization.
-    Removes whitespace, strips special characters, formats case (snake_case, lower_case, upper_case, camelCase).
+    Feature 10: Column Header Standardization with Collision Guards.
+    Formats column names safely, preventing duplicate header creation by appending _2, _3.
+    Returns modified DataFrame and the explicit mapping dictionary (Original -> New).
     """
     result = df.copy()
     old_columns = list(result.columns)
     new_columns = []
+    mapping = {}
+    seen_counts: Dict[str, int] = {}
 
     for col in old_columns:
         c = str(col).strip()
-        c = re.sub(r"[^\w\s]", "", c)
-        c = re.sub(r"[\s]+", "_", c)
+        # Preserve meaningful symbols like currency ($), percent (%), underscores
+        c = re.sub(r"[\s\-]+", "_", c)
+        c = re.sub(r"[^\w$%_]", "", c)
 
         if case_style == "snake_case":
             c = c.lower()
@@ -76,17 +81,26 @@ def standardize_column_headers(
             parts = c.split("_")
             c = parts[0].lower() + "".join(word.capitalize() for word in parts[1:])
 
-        new_columns.append(c)
+        # Collision guard
+        if c in seen_counts:
+            seen_counts[c] += 1
+            final_col = f"{c}_{seen_counts[c]}"
+        else:
+            seen_counts[c] = 1
+            final_col = c
+
+        new_columns.append(final_col)
+        mapping[str(col)] = final_col
 
     result.columns = new_columns
     if logger:
         logger.log(
             action="Standardize Column Headers",
-            details=f"Formatted columns to {case_style}",
+            details=f"Formatted columns to {case_style}. Mapping: {mapping}",
             rows_affected=0,
             columns_affected=new_columns
         )
-    return result
+    return result, mapping
 
 
 def impute_missing_values(
@@ -98,7 +112,6 @@ def impute_missing_values(
 ) -> pd.DataFrame:
     """
     Feature 6: Missing Value Imputation.
-    Supported strategies: mean, median, mode, constant, ffill, bfill.
     """
     result = df.copy()
     target_cols = columns if columns is not None else list(result.columns)
@@ -156,20 +169,22 @@ def drop_missing_values(
     logger: Optional[AuditLogger] = None
 ) -> pd.DataFrame:
     """
-    Feature 7: Missing Value Dropping with threshold-based row and column removal.
+    Feature 7: Missing Value Dropping with math.ceil non-null requirement rounding.
+    Prevents silent distortion of missing value thresholds.
     """
     result = df.copy()
     initial_rows = len(result)
     initial_cols = len(result.columns)
 
     if col_threshold_pct is not None:
-        col_thresh = (100.0 - col_threshold_pct) / 100.0 * initial_rows
-        result = result.dropna(axis=1, thresh=int(col_thresh))
+        # Minimum non-null rows required = ceil((100 - pct) / 100 * initial_rows)
+        min_non_null_rows = math.ceil((100.0 - col_threshold_pct) / 100.0 * initial_rows)
+        result = result.dropna(axis=1, thresh=min_non_null_rows)
 
     if row_threshold_pct is not None:
         total_cols = len(result.columns)
-        row_thresh = int((100.0 - row_threshold_pct) / 100.0 * total_cols)
-        result = result.dropna(axis=0, thresh=row_thresh)
+        min_non_null_cols = math.ceil((100.0 - row_threshold_pct) / 100.0 * total_cols)
+        result = result.dropna(axis=0, thresh=min_non_null_cols)
     elif columns:
         result = result.dropna(axis=0, how=how, subset=columns)
     else:
@@ -195,7 +210,7 @@ def remove_duplicates(
     logger: Optional[AuditLogger] = None
 ) -> pd.DataFrame:
     """
-    Feature 8: Duplicate Removal (exact and partial duplicate purging).
+    Feature 8: Duplicate Removal.
     """
     initial_rows = len(df)
     result = df.drop_duplicates(subset=subset, keep=keep)  # type: ignore
@@ -222,7 +237,6 @@ def treat_outliers(
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     """
     Feature 9: Outlier Detection & Treatment.
-    Z-score and IQR-based anomaly flagging with capping/clipping/dropping.
     """
     if column not in df.columns or not pd.api.types.is_numeric_dtype(df[column]):
         raise ValueError(f"Column '{column}' is not a valid numeric column.")
@@ -299,7 +313,6 @@ def clean_text_columns(
 ) -> pd.DataFrame:
     """
     Feature 11: Text & String Cleaning with strict null preservation.
-    Never converts NaN to string 'nan' or 'None'.
     """
     result = df.copy()
 
@@ -350,7 +363,6 @@ BOOLEAN_FALSE_VALUES = {"false", "no", "n", "0", "0.0", "f"}
 def parse_boolean_series(series: pd.Series) -> pd.Series:
     """
     Explicit boolean parser.
-    Eliminates astype(bool) bugs where non-empty string 'False' turns into True.
     """
     def to_bool(val):
         if pd.isna(val):
@@ -372,22 +384,28 @@ def cast_data_types(
     df: pd.DataFrame,
     type_conversions: Dict[str, str],
     logger: Optional[AuditLogger] = None
-) -> pd.DataFrame:
+) -> Tuple[pd.DataFrame, Dict[str, int]]:
     """
-    Feature 12: Data Type Casting with robust boolean parsing.
+    Feature 12: Data Type Casting with unparsed token accounting.
+    Returns converted DataFrame and dictionary of unparsed tokens coerced to NaN/NaT.
     """
     result = df.copy()
     succeeded_cols = []
+    unparsed_tokens = {}
 
     for col, target_type in type_conversions.items():
         if col not in result.columns:
             continue
         target = target_type.lower()
+        initial_nans = int(result[col].isna().sum())
+
         try:
             if target in ["int", "int64", "integer"]:
-                result[col] = pd.to_numeric(result[col], errors="coerce").astype("Int64")
+                coerced = pd.to_numeric(result[col], errors="coerce")
+                result[col] = coerced.astype("Int64")
             elif target in ["float", "float64"]:
-                result[col] = pd.to_numeric(result[col], errors="coerce").astype(float)
+                coerced = pd.to_numeric(result[col], errors="coerce")
+                result[col] = coerced.astype(float)
             elif target in ["str", "string"]:
                 result[col] = result[col].astype("string")
             elif target in ["datetime", "date"]:
@@ -396,6 +414,12 @@ def cast_data_types(
                 result[col] = parse_boolean_series(result[col])
             elif target in ["category", "categorical"]:
                 result[col] = result[col].astype("category")
+
+            new_nans = int(result[col].isna().sum())
+            unparsed = max(0, new_nans - initial_nans)
+            if unparsed > 0:
+                unparsed_tokens[col] = unparsed
+
             succeeded_cols.append(col)
         except Exception as e:
             raise ValueError(f"Failed casting {col} to {target}: {str(e)}")
@@ -403,17 +427,16 @@ def cast_data_types(
     if logger:
         logger.log(
             action="Data Type Casting",
-            details=f"Converted types: {type_conversions}",
+            details=f"Converted types: {type_conversions}. Coerced to NaN: {unparsed_tokens}",
             rows_affected=len(result),
             columns_affected=succeeded_cols
         )
-    return result
+    return result, unparsed_tokens
 
 
 def analyze_cleaning_recommendations(df: pd.DataFrame) -> Dict[str, Any]:
     """
     Generates actionable, non-destructive cleaning recommendations for user inspection.
-    Prevents blind mutations.
     """
     recs = {
         "header_standardization_needed": any(not c.isidentifier() for c in df.columns),
@@ -457,15 +480,14 @@ def run_automated_cleaning(
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     """
     Explicit, controlled cleaning pipeline.
-    By default, performs safe non-mutating cleanup (headers, exact duplicates, text whitespace)
-    and DOES NOT blindly impute values or cap outliers unless explicitly configured by the user.
     """
     audit = logger if logger is not None else AuditLogger()
     cleaned = df.copy()
 
-    # 1. Standardize headers
+    # 1. Standardize headers with collision guards
+    header_mapping = {}
     if standardize_headers:
-        cleaned = standardize_column_headers(cleaned, case_style="snake_case", logger=audit)
+        cleaned, header_mapping = standardize_column_headers(cleaned, case_style="snake_case", logger=audit)
 
     # 2. Purge exact duplicates
     if purge_duplicates:
@@ -502,6 +524,7 @@ def run_automated_cleaning(
         "final_rows": len(cleaned),
         "final_columns": len(cleaned.columns),
         "steps_executed": len(audit.get_logs()),
+        "header_mapping": header_mapping,
         "imputation_performed": impute_missing,
         "outlier_capping_performed": cap_outliers,
         "outlier_caps": outlier_summary

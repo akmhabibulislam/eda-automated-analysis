@@ -1,6 +1,7 @@
 """
 Memory management and optimization layer for data processing pipelines.
-Provides precision-safe numeric downcasting, RAM tracking, and selective garbage collection.
+Provides precision-safe numeric downcasting with nullable integer support,
+RAM tracking, and selective garbage collection.
 """
 
 import gc
@@ -63,32 +64,11 @@ def optimize_dataframe_memory(
     category_threshold: float = 0.20
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     """
-    Memory optimization layer with strict precision preservation.
+    Precision-safe memory optimization layer.
 
-    Rules:
-    1. Integer downcasting is safe and enabled by default (int64 -> int32/int16/int8 based on min/max bounds).
-    2. Float downcasting (float64 -> float32) is DISABLED by default to prevent silent loss of
-       precision in scientific or financial metrics. Must be explicitly requested.
-    3. Low-cardinality conversion to categorical is DISABLED by default so that storage
-       optimization does not conflate with analytical semantic type detection.
-
-    Parameters:
-    -----------
-    df : pd.DataFrame
-        Input dataframe to optimize
-    downcast_integers : bool
-        Whether to downcast integer columns safely
-    downcast_floats : bool
-        Whether to downcast float columns (opt-in only)
-    convert_categories : bool
-        Whether to convert object columns to category dtype (opt-in only)
-    category_threshold : float
-        Ratio of unique values to total rows below which a column can be categorical
-
-    Returns:
-    --------
-    Tuple[pd.DataFrame, Dict[str, Any]]
-        Optimized dataframe and performance impact metrics
+    Nullable Integer Safety:
+    Uses Pandas nullable integer dtypes ("Int8", "Int16", "Int32", "Int64") when missing
+    values are present, preventing crashes caused by NumPy integer conversions.
     """
     if df is None or df.empty:
         return df, {"initial_mb": 0.0, "final_mb": 0.0, "reduction_percent": 0.0}
@@ -101,30 +81,52 @@ def optimize_dataframe_memory(
 
     for col in optimized_df.columns:
         col_type = optimized_df[col].dtype
+        has_nulls = bool(optimized_df[col].isna().any())
 
-        # Safe Integer downcasting
-        if downcast_integers and pd.api.types.is_integer_dtype(col_type):
-            c_min = optimized_df[col].min()
-            c_max = optimized_df[col].max()
-            if pd.notna(c_min) and pd.notna(c_max):
-                if c_min >= np.iinfo(np.int8).min and c_max <= np.iinfo(np.int8).max:
-                    optimized_df[col] = optimized_df[col].astype(np.int8)
-                elif c_min >= np.iinfo(np.int16).min and c_max <= np.iinfo(np.int16).max:
-                    optimized_df[col] = optimized_df[col].astype(np.int16)
-                elif c_min >= np.iinfo(np.int32).min and c_max <= np.iinfo(np.int32).max:
-                    optimized_df[col] = optimized_df[col].astype(np.int32)
-                else:
-                    optimized_df[col] = optimized_df[col].astype(np.int64)
+        # Safe Integer downcasting (supporting nullable Int dtypes)
+        if downcast_integers and (pd.api.types.is_integer_dtype(col_type) or (has_nulls and pd.api.types.is_float_dtype(col_type))):
+            s = optimized_df[col]
+            # Check if float series actually represents whole numbers with NaNs
+            is_pseudo_int = False
+            if has_nulls and pd.api.types.is_float_dtype(col_type):
+                non_nulls = s.dropna()
+                if len(non_nulls) > 0 and (non_nulls % 1 == 0).all():
+                    is_pseudo_int = True
 
-        # Opt-in Float downcasting (never default)
-        if downcast_floats and pd.api.types.is_float_dtype(col_type):
+            if pd.api.types.is_integer_dtype(col_type) or is_pseudo_int:
+                c_min = s.min()
+                c_max = s.max()
+                if pd.notna(c_min) and pd.notna(c_max):
+                    if has_nulls or is_pseudo_int:
+                        # Use Pandas Nullable Integer types
+                        if c_min >= -128 and c_max <= 127:
+                            optimized_df[col] = s.astype("Int8")
+                        elif c_min >= -32768 and c_max <= 32767:
+                            optimized_df[col] = s.astype("Int16")
+                        elif c_min >= -2147483648 and c_max <= 2147483647:
+                            optimized_df[col] = s.astype("Int32")
+                        else:
+                            optimized_df[col] = s.astype("Int64")
+                    else:
+                        # Standard NumPy non-nullable types
+                        if c_min >= np.iinfo(np.int8).min and c_max <= np.iinfo(np.int8).max:
+                            optimized_df[col] = s.astype(np.int8)
+                        elif c_min >= np.iinfo(np.int16).min and c_max <= np.iinfo(np.int16).max:
+                            optimized_df[col] = s.astype(np.int16)
+                        elif c_min >= np.iinfo(np.int32).min and c_max <= np.iinfo(np.int32).max:
+                            optimized_df[col] = s.astype(np.int32)
+                        else:
+                            optimized_df[col] = s.astype(np.int64)
+
+        # Opt-in Float downcasting (disabled by default)
+        elif downcast_floats and pd.api.types.is_float_dtype(col_type):
             c_min = optimized_df[col].min()
             c_max = optimized_df[col].max()
             if pd.notna(c_min) and pd.notna(c_max):
                 if c_min >= np.finfo(np.float32).min and c_max <= np.finfo(np.float32).max:
                     optimized_df[col] = optimized_df[col].astype(np.float32)
 
-        # Opt-in Categorical conversion
+        # Opt-in Categorical conversion (disabled by default)
         if convert_categories and (col_type == "object" or col_type == "string"):
             num_unique = optimized_df[col].nunique(dropna=False)
             if n_rows > 0 and (num_unique / n_rows) <= category_threshold:
@@ -151,8 +153,6 @@ def optimize_dataframe_memory(
 
 
 def free_memory(force: bool = False):
-    """
-    Explicitly trigger garbage collection only when requested.
-    """
+    """Explicitly trigger garbage collection only when requested."""
     if force:
         gc.collect()

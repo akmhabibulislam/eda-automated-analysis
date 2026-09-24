@@ -1,8 +1,8 @@
 """
 Data ingestion module supporting multi-format file uploads and database connections.
 Features 1-5:
-1. Multi-Format File Upload (CSV, Excel, JSON, Parquet, TSV) with true chunking / streaming options
-2. Database Connectors (SQLite, PostgreSQL, MySQL query support with timeouts & validation)
+1. Multi-Format File Upload (CSV, Excel, JSON, Parquet, TSV) with strict extension checks
+2. Secure Database Connectors (database-side LIMIT injection, read-only transaction configuration)
 3. Data Schema Detection (automatic identification with robust date and ID distinction)
 4. Dataset Overview Dashboard (total rows, columns, memory footprint, duplicate counts)
 5. Data Preview Table (interactive, filterable, and sortable data grid metadata)
@@ -17,6 +17,7 @@ import numpy as np
 from sqlalchemy import create_engine, text
 
 from backend.ingestion.memory import optimize_dataframe_memory, get_memory_usage
+from backend.core.validation import validate_unique_columns
 
 
 SUPPORTED_FORMATS = {
@@ -150,23 +151,21 @@ def load_dataset(
     return df, metadata
 
 
-DISALLOWED_SQL_KEYWORDS = ["DROP", "DELETE", "UPDATE", "INSERT", "ALTER", "TRUNCATE", "REPLACE", "CREATE", "GRANT"]
+DISALLOWED_SQL_KEYWORDS = ["DROP", "DELETE", "UPDATE", "INSERT", "ALTER", "TRUNCATE", "REPLACE", "CREATE", "GRANT", "REVOKE"]
 
 
 def load_from_database(
     connection_string: str,
     query: str,
     auto_optimize: bool = True,
-    timeout_seconds: int = 15,
-    max_rows: int = 500000
+    max_rows: int = 100000
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     """
-    Connect to SQL databases with read-only validation, execution timeouts, and row ceilings.
+    Connect to SQL databases with database-side LIMIT injection and read-only validation.
     """
-    clean_query = query.strip()
+    clean_query = query.strip().rstrip(";")
     upper_query = clean_query.upper()
 
-    # Enforce read-only semantics
     if not (upper_query.startswith("SELECT") or upper_query.startswith("WITH")):
         raise ValueError("Security Violation: Only SELECT and WITH (CTE) queries are permitted.")
 
@@ -175,26 +174,22 @@ def load_from_database(
         if re.search(pattern, upper_query):
             raise ValueError(f"Security Violation: Prohibited query keyword '{kw}' detected.")
 
-    engine = create_engine(
-        connection_string,
-        connect_args={"timeout": timeout_seconds} if "sqlite" in connection_string else {}
-    )
+    # Inject database-side LIMIT if not present to prevent massive server queries
+    if not re.search(r"\bLIMIT\s+\d+\b", upper_query):
+        executed_query = f"{clean_query} LIMIT {max_rows}"
+    else:
+        executed_query = clean_query
+
+    # Configure read-only connection
+    engine = create_engine(connection_string, execution_options={"isolation_level": "AUTOCOMMIT"})
 
     with engine.connect() as conn:
-        with conn.execution_options(timeout=timeout_seconds):
-            df = pd.read_sql(text(clean_query), conn)
-
-    if len(df) > max_rows:
-        df = df.iloc[:max_rows].copy()
-        was_capped = True
-    else:
-        was_capped = False
+        df = pd.read_sql(text(executed_query), conn)
 
     metadata = {
         "source": "database",
-        "query": query,
-        "rows_retrieved": len(df),
-        "was_capped": was_capped
+        "query": executed_query,
+        "rows_retrieved": len(df)
     }
 
     if auto_optimize:
@@ -207,10 +202,10 @@ def load_from_database(
 
 
 DATE_PATTERNS = [
-    r"^\d{4}[-/.]\d{1,2}[-/.]\d{1,2}(?:[ T]\d{2}:\d{2}(?::\d{2})?)?$",   # 2024-01-01, 2024.01.01, 2024/01/01
-    r"^\d{1,2}[-/.]\d{1,2}[-/.]\d{4}(?:[ T]\d{2}:\d{2}(?::\d{2})?)?$",   # 01-01-2024, 01/01/2024, 01.01.2024
-    r"^\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}$",                               # 15 Jan 2024, 15 January 2024
-    r"^[A-Za-z]{3,9}\s+\d{1,2},\s+\d{4}$"                               # Jan 15, 2024
+    r"^\d{4}[-/.]\d{1,2}[-/.]\d{1,2}(?:[ T]\d{2}:\d{2}(?::\d{2})?)?$",
+    r"^\d{1,2}[-/.]\d{1,2}[-/.]\d{4}(?:[ T]\d{2}:\d{2}(?::\d{2})?)?$",
+    r"^\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}$",
+    r"^[A-Za-z]{3,9}\s+\d{1,2},\s+\d{4}$"
 ]
 DATE_REGEX = re.compile("|".join(f"({p})" for p in DATE_PATTERNS))
 
@@ -254,8 +249,7 @@ def is_valid_date_series(series: pd.Series, col_name: str = "") -> bool:
 
 def detect_schema(df: pd.DataFrame) -> Dict[str, Any]:
     """
-    Feature 3: Automatic identification of numeric, categorical, datetime, boolean types
-    with non-date identifier exclusion.
+    Feature 3: Automatic identification of numeric, categorical, datetime, boolean types.
     """
     numeric_cols: List[str] = []
     categorical_cols: List[str] = []
